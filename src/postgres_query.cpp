@@ -155,6 +155,55 @@ static uint64_t ExtractPinnedConnId(TableFunctionBindInput &input) {
 	return pinned_connection_id;
 }
 
+//! Parses and describes a query as the unnamed statement, in one round trip. The unnamed statement is not closed,
+//! the next statement replaces it
+static PGresult *DescribeUnnamed(PGconn *conn, const string &sql) {
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DESCRIBE: " + sql + "\n");
+	}
+	if (!PQenterPipelineMode(conn) || !PQsendPrepare(conn, "", sql.c_str(), 0, nullptr) ||
+	    !PQsendDescribePrepared(conn, "") || !PQpipelineSync(conn)) {
+		throw BinderException("Failed to prepare query \"%s\": %s", sql, PQerrorMessage(conn));
+	}
+	PGresult *describe = nullptr;
+	string error;
+	for (idx_t command = 0; command < 2; command++) {
+		// the results of each command end with a NULL
+		while (auto result = PQgetResult(conn)) {
+			auto status = PQresultStatus(result);
+			if (status == PGRES_FATAL_ERROR && error.empty()) {
+				error = PQresultErrorMessage(result);
+			}
+			if (command == 1 && status == PGRES_COMMAND_OK) {
+				describe = result;
+			} else {
+				PQclear(result);
+			}
+		}
+	}
+	// the result of the sync, which ends the pipeline
+	PQclear(PQgetResult(conn));
+	PQexitPipelineMode(conn);
+	if (!error.empty() || !describe) {
+		PQclear(describe);
+		throw BinderException("Failed to prepare query \"%s\": %s", sql, error.empty() ? PQerrorMessage(conn) : error);
+	}
+	return describe;
+}
+
+//! Prepares a query as a named statement, which a plain query can execute later
+static unique_ptr<PostgresPreparedStatement> PrepareNamed(PostgresConnection &con, uint64_t pool_connection_id,
+                                                          const string &sql) {
+	auto conn_lock = con.Lock();
+	auto conn = con.GetConn();
+	string stmt_name = PostgresPreparedStatement::GenerateName();
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("PREPARE " + stmt_name + ": " + sql + "\n");
+	}
+	PGresult *prepared_res_ptr = PQprepare(conn, stmt_name.c_str(), sql.c_str(), 0, nullptr);
+	return make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
+}
+
 static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -209,21 +258,9 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	}
 
 	auto conn_lock = con.Lock();
-	auto conn = con.GetConn();
-	// prepare execution of the query to figure out the result types and names
-	string stmt_name = PostgresPreparedStatement::GenerateName();
-	if (PostgresConnection::DebugPrintQueries()) {
-		Printer::Print("PREPARE " + stmt_name + ": " + sql + "\n");
-	}
-	PGresult *prepared_res_ptr = PQprepare(conn, stmt_name.c_str(), sql.c_str(), 0, nullptr);
-	auto prepared = make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
-	// use describe_prepared
-	auto describe_prepared = PQdescribePrepared(conn, prepared->GetName().c_str());
-	PostgresResult describe_wrapper(describe_prepared);
-	if (!describe_prepared || PQresultStatus(describe_prepared) != PGRES_COMMAND_OK) {
-		auto extended_err = describe_prepared ? PQresultErrorMessage(describe_prepared) : PQerrorMessage(conn);
-		throw BinderException("Failed to describe prepared statement: %s", extended_err);
-	}
+	// the result types and names of the query
+	PostgresResult describe_wrapper(DescribeUnnamed(con.GetConn(), sql));
+	auto describe_prepared = describe_wrapper.res;
 	conn_lock.unlock();
 	int nparams = PQnparams(describe_prepared);
 	if (nparams != param_values.size()) {
@@ -237,9 +274,10 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	}
 	int nfields = PQnfields(describe_prepared);
 	if (nfields <= 0) {
+		// a command is sent with its parameters, it does not execute a prepared statement
 		return BindDML(context, input, return_types, names, catalog, con, std::move(preliminary_queries),
 		               std::move(sql), use_transaction, pinned_connection_id,
-		               PostgresParameters(std::move(param_types), std::move(param_values)), std::move(prepared));
+		               PostgresParameters(std::move(param_types), std::move(param_values)), nullptr);
 	}
 	auto result = make_uniq<PostgresBindData>(context, catalog.GetName());
 	result->pinned_connection_id = pinned_connection_id;
@@ -278,9 +316,12 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	result->query_mode = ResolveQueryMode(context, input, param_values);
 	result->params = PostgresParameters(std::move(param_types), std::move(param_values));
 	result->use_transaction = use_transaction;
-	result->prepared_statement = std::move(prepared);
 	result->clear_catalog_cache = ExtractFlag(input, "clear_catalog_cache", false);
 	PostgresScanFunction::PrepareBind(catalog.GetPostgresVersion(), context, *result, 0, catalog);
+	// a plain query can execute a statement prepared here, a COPY sends the query itself
+	if (result->query_mode == PostgresQueryMode::PLAIN_QUERY_BINARY || result->use_text_protocol) {
+		result->prepared_statement = PrepareNamed(con, pool_connection_id, result->sql);
+	}
 	return std::move(result);
 }
 

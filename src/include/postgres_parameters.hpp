@@ -28,6 +28,9 @@ public:
 
 	PostgresParameters(vector<Oid> types_p, vector<Value> values_p);
 
+	//! Parameters sent as text without a type, so that the server infers their types as for untyped literals
+	static PostgresParameters Text(vector<Value> values_p);
+
 	bool Empty() const {
 		return types.empty();
 	}

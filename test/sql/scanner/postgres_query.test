@@ -209,10 +209,11 @@ CALL postgres_query('s1', 'PREPARE p1 AS SELECT 42; EXECUTE p1;')
 ----
 Failed to prepare
 
+# parameters require a single statement, also without preparing
 statement error
 CALL postgres_query('s1', 'PREPARE p1 AS SELECT 42; EXECUTE p1;', prepare=FALSE, params=row(42))
 ----
-query parameters cannot be used with 'prepare=FALSE'
+cannot insert multiple commands into a prepared statement
 
 # use the same connection
 

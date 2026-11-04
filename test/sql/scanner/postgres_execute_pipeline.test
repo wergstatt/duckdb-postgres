@@ -1,0 +1,108 @@
+# name: test/sql/scanner/postgres_execute_pipeline.test
+# description: Test running several statements with their parameters in one round trip
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s1 (TYPE POSTGRES)
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE IF EXISTS pipeline_tbl')
+
+query I
+SELECT rowcount FROM postgres_execute_pipeline('s1', [
+  {'query': 'CREATE TABLE pipeline_tbl (i INTEGER, s TEXT)', 'params': []},
+  {'query': 'INSERT INTO pipeline_tbl VALUES ($1, $2), ($3, NULL)', 'params': ['1', 'one', '2']},
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2', 'params': ['two', '2']}
+])
+----
+0
+2
+1
+
+query II
+FROM postgres_query('s1', 'SELECT i, s FROM pipeline_tbl ORDER BY i')
+----
+1	one
+2	two
+
+# a statement that returns rows gives the first value of its first row
+query II
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2 RETURNING i', 'params': ['two', '2']},
+  {'query': 'SELECT s FROM pipeline_tbl WHERE i = $1', 'params': ['3']}
+])
+----
+1	2
+0	NULL
+
+# a failed statement names its position in the message and its SQLSTATE in the extra info, skips the statements after it
+# and fails the transaction
+statement ok
+SET errors_as_json = true
+
+statement error
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'DELETE FROM pipeline_tbl WHERE i = $1', 'params': ['1']},
+  {'query': 'INSERT INTO pipeline_tbl VALUES ($1)', 'params': ['not a number']},
+  {'query': 'DELETE FROM pipeline_tbl', 'params': []}
+])
+----
+<REGEX>:.*statement 2 of the pipeline.*"sqlstate":\s*"22P02".*
+
+statement ok
+RESET errors_as_json
+
+# the error does not contain the statement, nor the excerpt of it that Postgres gives, as they can contain values
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'SELECT nosuchcol, ''secret_value'' FROM pipeline_tbl', 'params': []}])
+----
+Failed to execute statement 1 of the pipeline: ERROR:  column "nosuchcol" does not exist
+
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'SELECT nosuchcol, ''secret_value'' FROM pipeline_tbl', 'params': []}])
+----
+<!REGEX>:(?s).*secret_value.*
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+2
+
+# libpq's pipeline mode does not support COPY, nor does a lost connection hang the pipeline
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'COPY pipeline_tbl TO STDOUT', 'params': []}])
+----
+COPY is not supported
+
+statement ok
+SET errors_as_json = true
+
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'SELECT pg_terminate_backend(pg_backend_pid())', 'params': []}])
+----
+<REGEX>:.*statement 1 of the pipeline.*"sqlstate":\s*"57P01".*
+
+statement ok
+RESET errors_as_json
+
+# the statements run in the transaction of the caller
+statement ok
+BEGIN
+
+statement ok
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl', 'params': []}])
+
+statement ok
+ROLLBACK
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+2
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE pipeline_tbl')

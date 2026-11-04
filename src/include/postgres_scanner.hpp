@@ -117,6 +117,11 @@ public:
 	PostgresExecuteFunction();
 };
 
+class PostgresExecutePipelineFunction : public TableFunction {
+public:
+	PostgresExecutePipelineFunction();
+};
+
 class PostgresPinConnectionFunction : public ScalarFunction {
 public:
 	PostgresPinConnectionFunction();

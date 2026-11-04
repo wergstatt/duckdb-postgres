@@ -25,6 +25,12 @@ class PostgresResult;
 class PostgresPreparedStatement;
 struct IndexInfo;
 
+//! A statement of a pipeline, with the parameters it refers to as $1, $2, ...
+struct PostgresPipelineStatement {
+	string query;
+	PostgresParameters params;
+};
+
 class PostgresConnection {
 public:
 	explicit PostgresConnection(PGconn *connection = nullptr);
@@ -51,6 +57,9 @@ public:
 
 	//! Submits a set of queries to be executed in the connection.
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
+	//! Executes statements in one round trip and returns the number of rows of each. A failed statement skips the
+	//! statements after it
+	vector<int64_t> ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements);
 
 	PostgresVersion GetPostgresVersion(ClientContext &context);
 

@@ -196,6 +196,74 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	return results;
 }
 
+vector<int64_t> PostgresConnection::ExecutePipeline(ClientContext &context,
+                                                    const vector<PostgresPipelineStatement> &statements) {
+	auto now = [] {
+		return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
+		    .time_since_epoch()
+		    .count();
+	};
+	lock_guard<mutex> guard(connection_lock);
+	auto conn = GetConn();
+	if (!PQenterPipelineMode(conn)) {
+		throw std::runtime_error("Failed to enter pipeline mode: " + string(PQerrorMessage(conn)));
+	}
+	auto previous = now();
+	string error_message;
+	idx_t sent = 0;
+	for (auto &statement : statements) {
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print(statement.query + "\n");
+		}
+		auto &params = statement.params;
+		// the flush request makes the server send each result as soon as its statement ran, not at the end
+		if (!PQsendQueryParams(conn, statement.query.c_str(), params.Count(), params.Types(), params.Values(),
+		                       params.Lengths(), params.Formats(), 0) ||
+		    !PQsendFlushRequest(conn)) {
+			error_message = "Failed to send query \"" + statement.query + "\": " + string(PQerrorMessage(conn));
+			break;
+		}
+		sent++;
+	}
+	if (!PQpipelineSync(conn) && error_message.empty()) {
+		error_message = "Failed to send pipeline: " + string(PQerrorMessage(conn));
+	}
+	vector<int64_t> rows;
+	for (idx_t i = 0; i < sent; i++) {
+		bool executed = false;
+		// the results of each statement end with a NULL
+		while (auto result = PQgetResult(conn)) {
+			auto status = PQresultStatus(result);
+			if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
+				rows.push_back(std::atoll(PQcmdTuples(result)));
+				executed = true;
+			} else if (status != PGRES_PIPELINE_ABORTED) {
+				if (error_message.empty()) {
+					error_message = "Failed to execute query \"" + statements[i].query +
+					                "\": " + string(PQresultErrorMessage(result));
+				}
+				executed = true;
+			}
+			PQclear(result);
+		}
+		auto finished = now();
+		if (executed) {
+			// the time since the previous result, so roughly what the server spent on the statement
+			DUCKDB_LOG(context, PostgresQueryLogType, statements[i].query, finished - previous);
+		}
+		previous = finished;
+	}
+	// the result of the sync, which ends the pipeline
+	PQclear(PQgetResult(conn));
+	if (!PQexitPipelineMode(conn) && error_message.empty()) {
+		error_message = "Failed to leave pipeline mode: " + string(PQerrorMessage(conn));
+	}
+	if (!error_message.empty()) {
+		throw std::runtime_error(error_message);
+	}
+	return rows;
+}
+
 PostgresVersion PostgresConnection::GetPostgresVersion(ClientContext &context) {
 	auto result = TryQuery(context, "SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')");
 	if (!result) {

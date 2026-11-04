@@ -122,4 +122,19 @@ PostgresParameters::PostgresParameters(vector<Oid> types_p, vector<Value> values
 	}
 }
 
+PostgresParameters PostgresParameters::Text(vector<Value> values_p) {
+	PostgresParameters result;
+	for (auto &value : values_p) {
+		// 0: no type, the server infers it
+		result.types.push_back(0);
+		result.values.push_back(value.IsNull() ? value : value.DefaultCastAs(LogicalType::VARCHAR));
+	}
+	for (auto &value : result.values) {
+		result.value_ptrs.push_back(value.IsNull() ? nullptr : StringValue::Get(value).c_str());
+		result.lengths.push_back(0);
+		result.formats.push_back(FORMAT_TEXT);
+	}
+	return result;
+}
+
 } // namespace duckdb

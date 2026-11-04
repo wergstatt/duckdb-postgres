@@ -155,6 +155,19 @@ FROM postgres_query('s1', 'SELECT i FROM execute_params_tbl')
 ----
 42
 
+# without preparing, the values are sent as text, so a BIGINT also fits the INTEGER column
+query I
+FROM postgres_execute('s1', 'INSERT INTO execute_params_tbl VALUES ($1), ($2)', prepare=FALSE, params=row(43::BIGINT, NULL))
+----
+2
+
+query I
+FROM postgres_query('s1', 'SELECT i FROM execute_params_tbl ORDER BY i NULLS LAST')
+----
+42
+43
+NULL
+
 statement error
 CALL postgres_execute('s1', 'INSERT INTO execute_params_tbl VALUES ($1)', params=row(42, 43))
 ----

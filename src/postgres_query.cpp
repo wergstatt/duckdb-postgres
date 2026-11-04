@@ -203,11 +203,9 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	PostgresConnection &con = *con_ptr;
 
 	if (!ExtractFlag(input, "prepare", true)) {
-		if (param_values.size() > 0) {
-			throw BinderException("query parameters cannot be used with 'prepare=FALSE'");
-		}
 		return BindDML(context, input, return_types, names, catalog, con, std::move(preliminary_queries),
-		               std::move(sql), use_transaction, pinned_connection_id, PostgresParameters(), nullptr);
+		               std::move(sql), use_transaction, pinned_connection_id,
+		               PostgresParameters::Text(std::move(param_values)), nullptr);
 	}
 
 	auto conn_lock = con.Lock();

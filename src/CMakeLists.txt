@@ -14,6 +14,7 @@ add_library(
   postgres_connection.cpp
   postgres_copy_from.cpp
   postgres_copy_to.cpp
+  postgres_execute_pipeline.cpp
   postgres_extension.cpp
   postgres_filter_pushdown.cpp
   postgres_hstore.cpp

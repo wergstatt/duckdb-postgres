@@ -14,7 +14,7 @@ struct PostgresExecutePipelineBindData : public TableFunctionData {
 };
 
 struct PostgresExecutePipelineState : public GlobalTableFunctionState {
-	vector<int64_t> rows;
+	vector<PostgresPipelineResult> results;
 	idx_t offset = 0;
 };
 
@@ -32,8 +32,8 @@ static vector<PostgresPipelineStatement> ExtractStatements(const Value &statemen
 }
 
 static unique_ptr<FunctionData> PostgresExecutePipelineBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types,
-                                                           vector<Identifier> &names) {
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw BinderException("Parameters to postgres_execute_pipeline cannot be NULL");
 	}
@@ -42,6 +42,8 @@ static unique_ptr<FunctionData> PostgresExecutePipelineBind(ClientContext &conte
 	result->statements = ExtractStatements(input.inputs[1]);
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rowcount");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("result");
 	return std::move(result);
 }
 
@@ -52,16 +54,17 @@ static unique_ptr<GlobalTableFunctionState> PostgresExecutePipelineInit(ClientCo
 	auto &transaction = Transaction::Get(context, catalog).Cast<PostgresTransaction>();
 	auto result = make_uniq<PostgresExecutePipelineState>();
 	// executed here and not at bind, so that EXPLAIN does not run the statements
-	result->rows = transaction.GetConnection().ExecutePipeline(context, data.statements);
+	result->results = transaction.GetConnection().ExecutePipeline(context, data.statements);
 	return std::move(result);
 }
 
 static void PostgresExecutePipelineScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<PostgresExecutePipelineState>();
-	auto count = MinValue<idx_t>(state.rows.size() - state.offset, STANDARD_VECTOR_SIZE);
-	auto writer = FlatVector::Writer<int64_t>(output.data[0], count);
+	auto count = MinValue<idx_t>(state.results.size() - state.offset, STANDARD_VECTOR_SIZE);
 	for (idx_t i = 0; i < count; i++) {
-		writer.WriteValue(state.rows[state.offset++]);
+		auto &result = state.results[state.offset++];
+		output.SetValue(0, i, Value::BIGINT(result.rows));
+		output.SetValue(1, i, result.value);
 	}
 	output.SetCardinality(count);
 }

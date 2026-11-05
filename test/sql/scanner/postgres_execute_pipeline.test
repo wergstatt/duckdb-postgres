@@ -13,7 +13,7 @@ statement ok
 CALL postgres_execute('s1', 'DROP TABLE IF EXISTS pipeline_tbl')
 
 query I
-FROM postgres_execute_pipeline('s1', [
+SELECT rowcount FROM postgres_execute_pipeline('s1', [
   {'query': 'CREATE TABLE pipeline_tbl (i INTEGER, s TEXT)', 'params': []},
   {'query': 'INSERT INTO pipeline_tbl VALUES ($1, $2), ($3, NULL)', 'params': ['1', 'one', '2']},
   {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2', 'params': ['two', '2']}
@@ -28,6 +28,16 @@ FROM postgres_query('s1', 'SELECT i, s FROM pipeline_tbl ORDER BY i')
 ----
 1	one
 2	two
+
+# a statement that returns rows gives the first value of its first row
+query II
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2 RETURNING i', 'params': ['two', '2']},
+  {'query': 'SELECT s FROM pipeline_tbl WHERE i = $1', 'params': ['3']}
+])
+----
+1	2
+0	NULL
 
 # a failed statement skips the statements after it
 statement error

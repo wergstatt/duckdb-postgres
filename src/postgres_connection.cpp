@@ -196,8 +196,8 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	return results;
 }
 
-vector<int64_t> PostgresConnection::ExecutePipeline(ClientContext &context,
-                                                    const vector<PostgresPipelineStatement> &statements) {
+vector<PostgresPipelineResult>
+PostgresConnection::ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements) {
 	auto now = [] {
 		return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 		    .time_since_epoch()
@@ -228,14 +228,16 @@ vector<int64_t> PostgresConnection::ExecutePipeline(ClientContext &context,
 	if (!PQpipelineSync(conn) && error_message.empty()) {
 		error_message = "Failed to send pipeline: " + string(PQerrorMessage(conn));
 	}
-	vector<int64_t> rows;
+	vector<PostgresPipelineResult> results;
 	for (idx_t i = 0; i < sent; i++) {
 		bool executed = false;
 		// the results of each statement end with a NULL
 		while (auto result = PQgetResult(conn)) {
 			auto status = PQresultStatus(result);
 			if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
-				rows.push_back(std::atoll(PQcmdTuples(result)));
+				auto has_value = PQntuples(result) > 0 && PQnfields(result) > 0 && !PQgetisnull(result, 0, 0);
+				results.push_back({std::atoll(PQcmdTuples(result)),
+				                   has_value ? Value(PQgetvalue(result, 0, 0)) : Value(LogicalType::VARCHAR)});
 				executed = true;
 			} else if (status != PGRES_PIPELINE_ABORTED) {
 				if (error_message.empty()) {
@@ -261,7 +263,7 @@ vector<int64_t> PostgresConnection::ExecutePipeline(ClientContext &context,
 	if (!error_message.empty()) {
 		throw std::runtime_error(error_message);
 	}
-	return rows;
+	return results;
 }
 
 PostgresVersion PostgresConnection::GetPostgresVersion(ClientContext &context) {

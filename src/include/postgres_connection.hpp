@@ -31,6 +31,13 @@ struct PostgresPipelineStatement {
 	PostgresParameters params;
 };
 
+//! The result of a statement of a pipeline
+struct PostgresPipelineResult {
+	int64_t rows;
+	//! The first value of the first row, as text, for statements that return rows
+	Value value;
+};
+
 class PostgresConnection {
 public:
 	explicit PostgresConnection(PGconn *connection = nullptr);
@@ -57,9 +64,10 @@ public:
 
 	//! Submits a set of queries to be executed in the connection.
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
-	//! Executes statements in one round trip and returns the number of rows of each. A failed statement skips the
-	//! statements after it
-	vector<int64_t> ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements);
+	//! Executes statements in one round trip and returns the result of each. A failed statement skips the statements
+	//! after it
+	vector<PostgresPipelineResult> ExecutePipeline(ClientContext &context,
+	                                               const vector<PostgresPipelineStatement> &statements);
 
 	PostgresVersion GetPostgresVersion(ClientContext &context);
 

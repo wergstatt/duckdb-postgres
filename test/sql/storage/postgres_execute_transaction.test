@@ -56,12 +56,17 @@ CALL enable_logging('PostgresQueryLog');
 statement ok
 DESCRIBE
 
+# a transaction that sends no statement does not reach the server
 query I
-SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ%'
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog')
 ----
-1
+0
+
+# BEGIN and the preliminary queries go with the first statement of a transaction, then COMMIT
+statement ok
+CALL postgres_execute('s', 'SELECT 42', prepare=FALSE, preliminary_queries=['SELECT 43'])
 
 query I
-SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query = 'COMMIT'
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog')
 ----
-1
+2

@@ -125,10 +125,10 @@ EXECUTE p1
 ----
 0
 
-# the query sent to Postgres is the one specified by the user
+# the query sent to Postgres is the one specified by the user, BEGIN may go with it
 query I
-SELECT COUNT(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query = 'SELECT coalesce(max(generic_plans + custom_plans), 0) AS executions
-    FROM pg_prepared_statements WHERE statement LIKE ''%m_autocommit_{mode}%'''
+SELECT COUNT(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE ends_with(query, 'SELECT coalesce(max(generic_plans + custom_plans), 0) AS executions
+    FROM pg_prepared_statements WHERE statement LIKE ''%m_autocommit_{mode}%''')
 ----
 2
 

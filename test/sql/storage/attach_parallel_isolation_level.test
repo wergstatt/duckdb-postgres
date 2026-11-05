@@ -48,18 +48,19 @@ SELECT COUNT(*) FROM s.large_parallel_isolation
 ----
 1000000
 
-# parallel connections must also use READ COMMITTED (count > 1 proves it's not just the main transaction)
+# parallel connections must also use READ COMMITTED (count > 1 proves it's not just the main transaction), BEGIN goes
+# with the first query on each connection
 query I
 SELECT COUNT(*) > 1
 FROM duckdb_logs_parsed('PostgresQueryLog')
-WHERE query = 'BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY'
+WHERE query LIKE 'BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY;%COPY %'
 ----
 1
 
 query I
 SELECT COUNT(*)
 FROM duckdb_logs_parsed('PostgresQueryLog')
-WHERE query = 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'
+WHERE query LIKE 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY%'
 ----
 0
 
@@ -67,6 +68,6 @@ WHERE query = 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'
 query I
 SELECT COUNT(*)
 FROM duckdb_logs_parsed('PostgresQueryLog')
-WHERE query LIKE 'SET TRANSACTION SNAPSHOT%'
+WHERE query LIKE '%SET TRANSACTION SNAPSHOT%'
 ----
 0

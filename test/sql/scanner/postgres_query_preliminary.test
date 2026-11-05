@@ -92,10 +92,11 @@ FROM postgres_query('s', 'SELECT 42', preliminary_queries=['SELECT 1', NULL])
 ----
 All preliminary queries must be not NULL
 
+# the error names the preliminary query, also when it is sent with the query
 statement error
 FROM postgres_query('s', 'SELECT 42', preliminary_queries=['SELECT * FROM preliminary_queries_nonexistent'])
 ----
-preliminary_queries_nonexistent
+SELECT * FROM preliminary_queries_nonexistent
 
 statement ok
 DETACH s

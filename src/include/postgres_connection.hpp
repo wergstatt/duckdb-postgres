@@ -87,6 +87,8 @@ public:
 	void Close();
 	//! Whether the server answered on this connection within the last milliseconds
 	bool AnsweredWithin(uint64_t milliseconds) const;
+	//! Notes that the session of this connection may have changed, so that a reset has to discard it
+	void NoteSessionChanged();
 	bool PingServer(const std::string &health_check_query);
 	void Reset(const std::string &health_check_query);
 
@@ -117,10 +119,14 @@ private:
 
 	//! Notes that the server answered
 	void MarkAnswered();
+	//! Notes the statements sent on this connection, so a reset can tell whether they changed the session
+	void NoteStatements(const string &sql);
 
 	PGconn *connection = nullptr;
 	mutex connection_lock;
 	std::chrono::steady_clock::time_point last_answer;
+	//! Whether a statement may have changed the session, such as a SET or a temporary table
+	bool session_changed = false;
 	string dsn;
 };
 

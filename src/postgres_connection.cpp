@@ -12,6 +12,8 @@
 #include "postgres_logging.hpp"
 #include "postgres_prepared_statement.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 static bool debug_postgres_print_queries = false;
@@ -39,6 +41,7 @@ PostgresConnection::PostgresConnection(PostgresConnection &&other) noexcept {
 	std::swap(connection, other.connection);
 	std::swap(dsn, other.dsn);
 	std::swap(last_answer, other.last_answer);
+	std::swap(session_changed, other.session_changed);
 }
 
 PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) noexcept {
@@ -51,6 +54,7 @@ PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) no
 	std::swap(connection, other.connection);
 	std::swap(dsn, other.dsn);
 	std::swap(last_answer, other.last_answer);
+	std::swap(session_changed, other.session_changed);
 	return *this;
 }
 
@@ -86,6 +90,7 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 
 	PGconn *conn = GetConn();
 	PGresult *res = nullptr;
+	NoteStatements(query);
 
 	if (params.Empty() && format == 0) {
 		res = PQexec(GetConn(), query.c_str());
@@ -145,6 +150,7 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 
 	lock_guard<mutex> guard(connection_lock);
 	PGconn *conn = GetConn();
+	NoteStatements(query);
 	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
 	                                  params.Formats(), format);
 	MarkAnswered();
@@ -179,6 +185,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                         .time_since_epoch()
 	                         .count();
 	lock_guard<mutex> guard(connection_lock);
+	NoteStatements(queries);
 	auto res = PQsendQuery(GetConn(), queries.c_str());
 	if (res == 0) {
 		throw std::runtime_error("Failed to execute query \"" + queries + "\": " + string(PQerrorMessage(GetConn())));
@@ -232,6 +239,7 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 		if (PostgresConnection::DebugPrintQueries()) {
 			Printer::Print(statement.query + "\n");
 		}
+		NoteStatements(statement.query);
 		auto &params = statement.params;
 		// the flush request makes the server send each result as soon as its statement ran, not at the end
 		if (!PQsendQueryParams(conn, statement.query.c_str(), params.Count(), params.Types(), params.Values(),
@@ -302,6 +310,100 @@ PostgresVersion PostgresConnection::GetPostgresVersion(ClientContext &context) {
 	return version;
 }
 
+//! The words that start the statements of a query, skipping literals, quoted identifiers and comments
+static vector<vector<string>> LeadingWords(const string &sql, idx_t word_count) {
+	vector<vector<string>> result {{}};
+	idx_t i = 0;
+	while (i < sql.size()) {
+		auto c = sql[i];
+		if (c == ';') {
+			result.emplace_back();
+			i++;
+		} else if (c == '\'' || c == '"') {
+			auto end = sql.find(c, i + 1);
+			while (end != string::npos && end + 1 < sql.size() && sql[end + 1] == c) {
+				end = sql.find(c, end + 2);
+			}
+			i = end == string::npos ? sql.size() : end + 1;
+		} else if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+			auto end = sql.find('\n', i);
+			i = end == string::npos ? sql.size() : end + 1;
+		} else if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+			auto end = sql.find("*/", i + 2);
+			i = end == string::npos ? sql.size() : end + 2;
+		} else if (c == '$') {
+			auto tag_end = sql.find('$', i + 1);
+			auto tag = tag_end == string::npos ? string() : sql.substr(i, tag_end - i + 1);
+			auto is_tag = !tag.empty() && std::all_of(tag.begin() + 1, tag.end() - 1, [](char t) {
+				return StringUtil::CharacterIsAlphaNumeric(t) || t == '_';
+			});
+			if (!is_tag || StringUtil::CharacterIsDigit(tag[1])) {
+				i++;
+				continue;
+			}
+			auto end = sql.find(tag, tag_end + 1);
+			i = end == string::npos ? sql.size() : end + tag.size();
+		} else if (StringUtil::CharacterIsAlpha(c) || c == '_') {
+			auto start = i;
+			while (i < sql.size() && (StringUtil::CharacterIsAlphaNumeric(sql[i]) || sql[i] == '_')) {
+				i++;
+			}
+			if (result.back().size() < word_count) {
+				result.back().push_back(StringUtil::Upper(sql.substr(start, i - start)));
+			}
+		} else {
+			i++;
+		}
+	}
+	return result;
+}
+
+//! Whether the statements of a query leave the session as it was. Anything unknown counts as a change
+static bool LeavesSessionUnchanged(const string &sql) {
+	static const case_insensitive_set_t NEUTRAL = {
+	    "SELECT", "WITH",   "INSERT",  "UPDATE",   "DELETE", "MERGE",  "COPY",    "BEGIN", "START",
+	    "COMMIT", "END",    "ABORT",   "ROLLBACK", "VALUES", "TABLE",  "EXPLAIN", "ALTER", "DROP",
+	    "LOCK",   "VACUUM", "ANALYZE", "TRUNCATE", "GRANT",  "REVOKE", "COMMENT", "SAVEPOINT", "RELEASE"};
+	auto lower = StringUtil::Lower(sql);
+	// functions that change the session from within a statement
+	for (auto function : {"set_config", "advisory_lock(", "advisory_lock_shared(", "dblink_connect"}) {
+		if (lower.find(function) != string::npos) {
+			return false;
+		}
+	}
+	for (auto &words : LeadingWords(sql, 3)) {
+		if (words.empty()) {
+			continue;
+		}
+		auto &first = words[0];
+		if (first == "SET") {
+			// SET LOCAL and SET TRANSACTION end with the transaction
+			if (words.size() < 2 || (words[1] != "LOCAL" && words[1] != "TRANSACTION")) {
+				return false;
+			}
+		} else if (first == "CREATE") {
+			for (idx_t w = 1; w < words.size(); w++) {
+				if (words[w] == "TEMP" || words[w] == "TEMPORARY") {
+					return false;
+				}
+			}
+		} else if (NEUTRAL.find(first) == NEUTRAL.end()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void PostgresConnection::NoteStatements(const string &sql) {
+	if (!session_changed && !LeavesSessionUnchanged(sql)) {
+		session_changed = true;
+	}
+}
+
+void PostgresConnection::NoteSessionChanged() {
+	session_changed = true;
+}
+
 void PostgresConnection::MarkAnswered() {
 	last_answer = std::chrono::steady_clock::now();
 }
@@ -359,14 +461,19 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 		PGresult *res = PQexec(conn, "ROLLBACK");
 		PostgresResult res_holder(res);
 	}
+	if (!session_changed) {
+		return;
+	}
 	{
 		PGresult *res = PQexec(conn, "DISCARD ALL");
 		PostgresResult res_holder(res);
 		if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+			session_changed = false;
 			return;
 		}
 	}
 	PQreset(conn);
+	session_changed = false;
 	if (!PingServerInternal(health_check_query)) {
 		throw InternalException("Connection reset failure");
 	}

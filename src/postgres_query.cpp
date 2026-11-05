@@ -200,6 +200,8 @@ static unique_ptr<PostgresPreparedStatement> PrepareNamed(PostgresConnection &co
 	if (PostgresConnection::DebugPrintQueries()) {
 		Printer::Print("PREPARE " + stmt_name + ": " + sql + "\n");
 	}
+	// a named statement stays in the session until it is closed
+	con.NoteSessionChanged();
 	PGresult *prepared_res_ptr = PQprepare(conn, stmt_name.c_str(), sql.c_str(), 0, nullptr);
 	return make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
 }

@@ -1,0 +1,21 @@
+# name: test/sql/connection_pool/connection_pool_reset.test
+# description: A pooled connection whose session changed is reset before it is handed out again
+# group: [connection_pool]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+SET pg_pool_max_connections = 1
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES);
+
+statement ok
+CALL postgres_execute('s', 'SET application_name = ''changed''')
+
+query I
+SELECT application_name <> 'changed' FROM postgres_query('s', 'SHOW application_name')
+----
+true

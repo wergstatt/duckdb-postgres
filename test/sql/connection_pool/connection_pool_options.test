@@ -6,6 +6,10 @@ require postgres_scanner
 
 require-env POSTGRES_TEST_DATABASE_AVAILABLE
 
+# the health check runs on every connection that the pool hands out
+statement ok
+SET pg_pool_health_check_interval_millis = 0
+
 statement ok
 ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES);
 

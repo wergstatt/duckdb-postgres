@@ -16,7 +16,12 @@ namespace duckdb {
 using dbconnector::functions::ConfigurePool;
 
 PostgresConnectionPool::PostgresConnectionPool(PostgresCatalog &postgres_catalog, ClientContext &context)
-    : dbconnector::pool::ConnectionPool<PostgresConnection>(CreateConfig(context)), postgres_catalog(postgres_catalog) {
+    : dbconnector::pool::ConnectionPool<PostgresConnection>(CreateConfig(context)), postgres_catalog(postgres_catalog),
+      health_check_interval_millis(0) {
+	Value val;
+	if (context.TryGetCurrentSetting("pg_pool_health_check_interval_millis", val) && !val.IsNull()) {
+		health_check_interval_millis = UBigIntValue::Get(val);
+	}
 }
 
 bool PostgresConnectionPool::TryGetConnection(PostgresPoolConnection &connection) {
@@ -36,6 +41,10 @@ std::unique_ptr<PostgresConnection> PostgresConnectionPool::CreateNewConnection(
 bool PostgresConnectionPool::CheckConnectionHealthy(PostgresConnection &conn) {
 	if (!conn.IsOpen()) {
 		return false;
+	}
+	if (health_check_interval_millis > 0 && PQstatus(conn.GetConn()) == CONNECTION_OK &&
+	    conn.AnsweredWithin(health_check_interval_millis)) {
+		return true;
 	}
 	std::string query = GetHealthCheckQuery();
 	return conn.PingServer(query);

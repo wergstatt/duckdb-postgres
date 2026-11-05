@@ -1,0 +1,33 @@
+# name: test/sql/connection_pool/connection_pool_health_check_interval.test
+# description: A connection that the server answered on recently is handed out without a health check
+# group: [connection_pool]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+SET pg_pool_max_connections = 8
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES);
+
+query I
+FROM postgres_query('s', 'SELECT 42')
+----
+42
+
+statement ok
+FROM postgres_configure_pool(catalog_name='s', health_check_query='SELECT_FAIL')
+
+query I
+FROM postgres_query('s', 'SELECT 42')
+----
+42
+
+# the failing health check never ran, so the connection is still in the pool
+query II
+SELECT catalog_name, available_connections
+FROM postgres_configure_pool(catalog_name='s')
+----
+s	1

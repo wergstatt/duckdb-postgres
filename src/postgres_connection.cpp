@@ -38,6 +38,7 @@ PostgresConnection::PostgresConnection(PostgresConnection &&other) noexcept {
 	lock_guard<mutex> guard(other.connection_lock);
 	std::swap(connection, other.connection);
 	std::swap(dsn, other.dsn);
+	std::swap(last_answer, other.last_answer);
 }
 
 PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) noexcept {
@@ -49,6 +50,7 @@ PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) no
 	lock_guard<mutex> other_guard(other.connection_lock, std::adopt_lock);
 	std::swap(connection, other.connection);
 	std::swap(dsn, other.dsn);
+	std::swap(last_answer, other.last_answer);
 	return *this;
 }
 
@@ -56,6 +58,7 @@ PostgresConnection PostgresConnection::Open(const string &dsn, const string &att
 	PostgresConnection result;
 	result.connection = PostgresUtils::PGConnect(dsn, attach_path);
 	result.dsn = dsn;
+	result.MarkAnswered();
 	return result;
 }
 
@@ -95,6 +98,7 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
 	                       .count();
+	MarkAnswered();
 	if (context) {
 		DUCKDB_LOG(*context, PostgresQueryLogType, query, end_time - start_time);
 	}
@@ -143,6 +147,7 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 	PGconn *conn = GetConn();
 	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
 	                                  params.Formats(), format);
+	MarkAnswered();
 
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
@@ -203,6 +208,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
 	                       .count();
+	MarkAnswered();
 	DUCKDB_LOG(context, PostgresQueryLogType, queries, end_time - start_time);
 	return results;
 }
@@ -268,6 +274,7 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 	}
 	// the result of the sync, which ends the pipeline
 	PQclear(PQgetResult(conn));
+	MarkAnswered();
 	if (!PQexitPipelineMode(conn) && error_message.empty()) {
 		error_message = "Failed to leave pipeline mode: " + string(PQerrorMessage(conn));
 	}
@@ -293,6 +300,14 @@ PostgresVersion PostgresConnection::GetPostgresVersion(ClientContext &context) {
 		version.type_v = PostgresInstanceType::REDSHIFT;
 	}
 	return version;
+}
+
+void PostgresConnection::MarkAnswered() {
+	last_answer = std::chrono::steady_clock::now();
+}
+
+bool PostgresConnection::AnsweredWithin(uint64_t milliseconds) const {
+	return std::chrono::steady_clock::now() - last_answer < std::chrono::milliseconds(milliseconds);
 }
 
 bool PostgresConnection::IsOpen() {
@@ -326,7 +341,11 @@ bool PostgresConnection::PingServerInternal(const std::string &health_check_quer
 	}
 	PGresult *res = PQexec(conn, health_check_query.c_str());
 	PostgresResult res_holder(res);
-	return PQresultStatus(res) == PGRES_TUPLES_OK;
+	if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+		return false;
+	}
+	MarkAnswered();
+	return true;
 }
 
 void PostgresConnection::Reset(const std::string &health_check_query) {

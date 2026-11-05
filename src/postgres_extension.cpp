@@ -297,6 +297,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "an empty string disables the health check. " +
 	                              CreatePoolNote("health_check_query=SELECT 42"),
 	                          LogicalType::VARCHAR, default_pool_config.health_check_query, nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_health_check_interval_millis",
+	                          "A connection that the server answered on within this time is handed out without a "
+	                          "health check. 0 checks every connection.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(5000), nullptr, SetScope::GLOBAL);
 
 	OptimizerExtension postgres_optimizer;
 	postgres_optimizer.optimize_function = PostgresOptimizer::Optimize;

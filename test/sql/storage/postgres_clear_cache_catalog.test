@@ -1,0 +1,36 @@
+# name: test/sql/storage/postgres_clear_cache_catalog.test
+# description: postgres_clear_cache clears the cache of the given catalog
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s2 (TYPE POSTGRES)
+
+statement ok
+DROP TABLE IF EXISTS s.clear_cache_catalog_tbl
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 's' AND table_name = 'clear_cache_catalog_tbl'
+----
+0
+
+# created through another catalog, which the cache of s does not see
+statement ok
+CREATE TABLE s2.clear_cache_catalog_tbl AS SELECT 1 AS x
+
+statement ok
+CALL postgres_clear_cache(catalog := 's')
+
+query I
+SELECT x FROM s.clear_cache_catalog_tbl
+----
+1
+
+statement ok
+DROP TABLE s.clear_cache_catalog_tbl

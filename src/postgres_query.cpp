@@ -219,6 +219,7 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	}
 	PGresult *prepared_res_ptr = PQprepare(conn, stmt_name.c_str(), sql.c_str(), 0, nullptr);
 	auto prepared = make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
+	con.NoteStatementPrepared();
 	// use describe_prepared
 	auto describe_prepared = PQdescribePrepared(conn, prepared->GetName().c_str());
 	PostgresResult describe_wrapper(describe_prepared);

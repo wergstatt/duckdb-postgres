@@ -12,6 +12,8 @@
 #include "postgres_logging.hpp"
 #include "postgres_prepared_statement.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 static bool debug_postgres_print_queries = false;
@@ -26,6 +28,8 @@ PostgresConnection::~PostgresConnection() {
 PostgresConnection::PostgresConnection(PostgresConnection &&other) noexcept {
 	lock_guard<mutex> guard(other.connection_lock);
 	std::swap(connection, other.connection);
+	std::swap(session_changed, other.session_changed);
+	std::swap(open_statements, other.open_statements);
 	std::swap(dsn, other.dsn);
 }
 
@@ -37,6 +41,8 @@ PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) no
 	lock_guard<mutex> guard(connection_lock, std::adopt_lock);
 	lock_guard<mutex> other_guard(other.connection_lock, std::adopt_lock);
 	std::swap(connection, other.connection);
+	std::swap(session_changed, other.session_changed);
+	std::swap(open_statements, other.open_statements);
 	std::swap(dsn, other.dsn);
 	return *this;
 }
@@ -72,6 +78,7 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 
 	PGconn *conn = GetConn();
 	PGresult *res = nullptr;
+	NoteStatements(query);
 
 	if (params.Empty() && format == 0) {
 		res = PQexec(GetConn(), query.c_str());
@@ -130,6 +137,7 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 
 	lock_guard<mutex> guard(connection_lock);
 	PGconn *conn = GetConn();
+	NoteStatements(query);
 	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
 	                                  params.Formats(), format);
 
@@ -163,6 +171,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                         .time_since_epoch()
 	                         .count();
 	lock_guard<mutex> guard(connection_lock);
+	NoteStatements(queries);
 	auto res = PQsendQuery(GetConn(), queries.c_str());
 	if (res == 0) {
 		throw std::runtime_error("Failed to execute query \"" + queries + "\": " + string(PQerrorMessage(GetConn())));
@@ -259,6 +268,11 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 		PGresult *res = PQexec(conn, "ROLLBACK");
 		PostgresResult res_holder(res);
 	}
+	if (!session_changed && open_statements == 0 && PQtransactionStatus(conn) == PQTRANS_IDLE) {
+		return;
+	}
+	session_changed = false;
+	open_statements = 0;
 	{
 		PGresult *res = PQexec(conn, "DISCARD ALL");
 		PostgresResult res_holder(res);
@@ -270,6 +284,75 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 	if (!PingServerInternal(health_check_query)) {
 		throw InternalException("Connection reset failure");
 	}
+}
+
+//! The words of a text in upper case, split at anything but letters, digits and underscores
+static vector<string> Words(const string &text) {
+	vector<string> words;
+	idx_t start = 0;
+	for (idx_t i = 0; i <= text.size(); i++) {
+		if (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_')) {
+			continue;
+		}
+		if (i > start) {
+			words.push_back(StringUtil::Upper(text.substr(start, i - start)));
+		}
+		start = i + 1;
+	}
+	return words;
+}
+
+//! Whether the statements of a query leave the session as it was, so that DISCARD ALL has nothing to undo: no
+//! settings, temporary objects, session advisory locks, cursors or prepared statements that outlive the transaction.
+//! Anything unknown counts as a change. Literals and comments are not skipped: a semicolon or a word in them can only
+//! make a query count as a change, never hide one.
+static bool LeavesSessionUnchanged(const string &sql) {
+	// statements whose effects on the session end with the transaction
+	static const unordered_set<string> NEUTRAL = {
+	    "SELECT", "WITH",    "INSERT",   "UPDATE", "DELETE", "MERGE",   "COPY",      "BEGIN",  "START", "COMMIT",
+	    "END",    "ABORT",   "ROLLBACK", "VALUES", "TABLE",  "EXPLAIN", "CREATE",    "ALTER",  "DROP",  "LOCK",
+	    "VACUUM", "ANALYZE", "TRUNCATE", "GRANT",  "REVOKE", "COMMENT", "SAVEPOINT", "RELEASE"};
+	// words that change the session wherever they appear, as in SELECT ... INTO TEMP or SELECT set_config(...)
+	static const unordered_set<string> CHANGING = {"TEMP",
+	                                               "TEMPORARY",
+	                                               "PG_TEMP",
+	                                               "SET_CONFIG",
+	                                               "PG_ADVISORY_LOCK",
+	                                               "PG_ADVISORY_LOCK_SHARED",
+	                                               "PG_TRY_ADVISORY_LOCK",
+	                                               "PG_TRY_ADVISORY_LOCK_SHARED"};
+	for (auto &statement : StringUtil::Split(sql, ';')) {
+		auto start = statement.find_first_not_of(" \t\n\r\f\v");
+		if (start == string::npos) {
+			continue;
+		}
+		// a statement that starts with a comment or a parenthesis hides its kind
+		if (!StringUtil::CharacterIsAlpha(statement[start])) {
+			return false;
+		}
+		auto words = Words(statement);
+		// SET LOCAL and SET TRANSACTION end with the transaction
+		auto set_local = words[0] == "SET" && words.size() > 1 && (words[1] == "LOCAL" || words[1] == "TRANSACTION");
+		if (!set_local && NEUTRAL.count(words[0]) == 0) {
+			return false;
+		}
+		if (std::any_of(words.begin(), words.end(), [](const string &word) { return CHANGING.count(word) > 0; })) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void PostgresConnection::NoteStatements(const string &sql) {
+	session_changed = session_changed || !LeavesSessionUnchanged(sql);
+}
+
+void PostgresConnection::NoteStatementPrepared() {
+	open_statements++;
+}
+
+void PostgresConnection::NoteStatementClosed() {
+	open_statements--;
 }
 
 vector<IndexInfo> PostgresConnection::GetIndexInfo(const string &table_name) {

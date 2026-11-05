@@ -54,6 +54,7 @@ void PostgresPreparedStatement::Destroy(PostgresConnection &con) {
 		throw std::runtime_error(
 		    StringUtil::Format("Failed to close prepared statement \"%s\": %s", name, string(error)));
 	}
+	con.NoteStatementClosed();
 }
 
 bool PostgresPreparedStatement::IsDestroyed() const {

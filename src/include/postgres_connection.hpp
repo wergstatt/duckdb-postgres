@@ -70,6 +70,9 @@ public:
 	void Close();
 	bool PingServer(const std::string &health_check_query);
 	void Reset(const std::string &health_check_query);
+	//! Notes that a named statement was prepared on this connection, or closed again
+	void NoteStatementPrepared();
+	void NoteStatementClosed();
 
 	string GetDSN() {
 		return dsn;
@@ -95,10 +98,16 @@ private:
 	                    const PostgresParameters &params = PostgresParameters(), int format = 0);
 	//! Requires connection_lock to be held
 	bool PingServerInternal(const std::string &health_check_query);
+	//! Notes the statements sent on this connection, so that a reset can tell whether they changed the session
+	void NoteStatements(const string &sql);
 
 	PGconn *connection = nullptr;
 	mutex connection_lock;
 	string dsn;
+	//! Whether a statement may have changed the session beyond its transaction, such as a SET or a temporary table
+	bool session_changed = false;
+	//! The named statements prepared on this connection and not closed yet
+	idx_t open_statements = 0;
 };
 
 } // namespace duckdb

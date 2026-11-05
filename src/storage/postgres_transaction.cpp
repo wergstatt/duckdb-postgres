@@ -31,7 +31,10 @@ void PostgresTransaction::Start() {
 void PostgresTransaction::Commit() {
 	if (transaction_state == PostgresTransactionState::TRANSACTION_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
-		GetConnectionRaw().Execute(GetContext(), "COMMIT");
+		// a transaction that never reached the server has nothing to commit
+		if (!GetConnectionRaw().CancelDeferred()) {
+			GetConnectionRaw().Execute(GetContext(), "COMMIT");
+		}
 	}
 	vector<pair<reference<PostgresCatalogSet>, string>> to_promote;
 	{
@@ -45,7 +48,9 @@ void PostgresTransaction::Commit() {
 void PostgresTransaction::Rollback() {
 	if (transaction_state == PostgresTransactionState::TRANSACTION_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
-		GetConnectionRaw().Execute(GetContext(), "ROLLBACK");
+		if (!GetConnectionRaw().CancelDeferred()) {
+			GetConnectionRaw().Execute(GetContext(), "ROLLBACK");
+		}
 	}
 	lock_guard<mutex> l(pending_signatures_lock);
 	pending_signatures.clear();
@@ -90,8 +95,8 @@ PostgresConnection &PostgresTransaction::GetConnection() {
 	auto &con = GetConnectionRaw();
 	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string query = GetBeginTransactionQuery();
-		con.Execute(GetContext(), query);
+		// BEGIN goes with the first statement of the transaction
+		con.DeferBegin(GetBeginTransactionQuery());
 	}
 	return con;
 }

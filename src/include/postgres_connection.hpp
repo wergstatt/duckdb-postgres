@@ -89,6 +89,14 @@ public:
 	bool AnsweredWithin(uint64_t milliseconds) const;
 	//! Notes that the session of this connection may have changed, so that a reset has to discard it
 	void NoteSessionChanged();
+	//! Sends a statement ahead of the next request on this connection, instead of in a round trip of its own
+	void Defer(string statement);
+	//! Sends BEGIN ahead of the next request
+	void DeferBegin(string begin);
+	//! Drops the statements that were not sent yet, returns whether that includes the BEGIN of the transaction
+	bool CancelDeferred();
+	//! Takes the statements to send ahead of the next request, the connection lock must be held
+	vector<string> TakeDeferred();
 	bool PingServer(const std::string &health_check_query);
 	void Reset(const std::string &health_check_query);
 
@@ -127,6 +135,10 @@ private:
 	std::chrono::steady_clock::time_point last_answer;
 	//! Whether a statement may have changed the session, such as a SET or a temporary table
 	bool session_changed = false;
+	//! The statements to send ahead of the next request
+	vector<string> deferred;
+	//! Whether the deferred statements include the BEGIN of the transaction
+	bool begin_deferred = false;
 	string dsn;
 };
 

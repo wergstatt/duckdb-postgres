@@ -404,7 +404,7 @@ static unique_ptr<GlobalTableFunctionState> PostgresInitGlobalState(ClientContex
 	}
 
 	for (const string &query : bind_data.preliminary_queries) {
-		con.Execute(context, query);
+		con.Defer(query);
 	}
 
 	if (bind_data.command_only) {

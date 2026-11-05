@@ -79,6 +79,38 @@ static bool ResultHasError(PGresult *result) {
 	}
 }
 
+//! Runs the statements and then the query with its parameters, in one round trip. Returns the result of the first
+//! statement that failed, or else that of the query
+static PGresult *ExecuteAfter(PGconn *conn, const vector<string> &statements, const string &query,
+                              const PostgresParameters &params, int format) {
+	if (!PQenterPipelineMode(conn)) {
+		return nullptr;
+	}
+	bool sent = true;
+	for (auto &statement : statements) {
+		sent = sent && PQsendQueryParams(conn, statement.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 0);
+	}
+	sent = sent && PQsendQueryParams(conn, query.c_str(), params.Count(), params.Types(), params.Values(),
+	                                 params.Lengths(), params.Formats(), format);
+	sent = PQpipelineSync(conn) && sent;
+	PGresult *result = nullptr;
+	for (idx_t command = 0; sent && command <= statements.size(); command++) {
+		// the results of each command end with a NULL
+		while (auto command_result = PQgetResult(conn)) {
+			auto status = PQresultStatus(command_result);
+			if (!result && (status == PGRES_FATAL_ERROR || command == statements.size())) {
+				result = command_result;
+			} else {
+				PQclear(command_result);
+			}
+		}
+	}
+	// the result of the sync, which ends the pipeline
+	PQclear(PQgetResult(conn));
+	PQexitPipelineMode(conn);
+	return result;
+}
+
 PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, const string &query,
                                         const PostgresParameters &params, int format) {
 	if (PostgresConnection::DebugPrintQueries()) {
@@ -91,13 +123,20 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 	PGconn *conn = GetConn();
 	PGresult *res = nullptr;
 	NoteStatements(query);
+	auto deferred_statements = TakeDeferred();
+	// the log shows what is sent, deferred statements included
+	auto sent_query = deferred_statements.empty() ? query : StringUtil::Join(deferred_statements, ";\n") + ";\n" + query;
 
 	if (params.Empty() && format == 0) {
-		res = PQexec(GetConn(), query.c_str());
+		// a query string can hold several statements, so the deferred ones go ahead of it in the same round trip
+		deferred_statements.push_back(query);
+		res = PQexec(GetConn(), StringUtil::Join(deferred_statements, ";\n").c_str());
 	} else {
 		// Unlike PQexec, PQexecParams allows at most one SQL command in the given string.
-		res = PQexecParams(conn, query.c_str(), params.Count(), params.Types(), params.Values(), params.Lengths(),
-		                   params.Formats(), format);
+		res = deferred_statements.empty()
+		          ? PQexecParams(conn, query.c_str(), params.Count(), params.Types(), params.Values(),
+		                         params.Lengths(), params.Formats(), format)
+		          : ExecuteAfter(conn, deferred_statements, query, params, format);
 	}
 
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
@@ -105,7 +144,7 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 	                       .count();
 	MarkAnswered();
 	if (context) {
-		DUCKDB_LOG(*context, PostgresQueryLogType, query, end_time - start_time);
+		DUCKDB_LOG(*context, PostgresQueryLogType, sent_query, end_time - start_time);
 	}
 	return res;
 }
@@ -151,6 +190,14 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 	lock_guard<mutex> guard(connection_lock);
 	PGconn *conn = GetConn();
 	NoteStatements(query);
+	auto deferred_statements = TakeDeferred();
+	if (!deferred_statements.empty()) {
+		PostgresResult deferred_result(PQexec(conn, StringUtil::Join(deferred_statements, ";\n").c_str()));
+		if (ResultHasError(deferred_result.res)) {
+			throw std::runtime_error("Failed to execute query \"" + StringUtil::Join(deferred_statements, ";\n") +
+			                         "\": " + ResultErrorMessage(deferred_result.res));
+		}
+	}
 	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
 	                                  params.Formats(), format);
 	MarkAnswered();
@@ -186,7 +233,10 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                         .count();
 	lock_guard<mutex> guard(connection_lock);
 	NoteStatements(queries);
-	auto res = PQsendQuery(GetConn(), queries.c_str());
+	auto all_queries = TakeDeferred();
+	all_queries.push_back(queries);
+	auto sent_queries = StringUtil::Join(all_queries, ";\n");
+	auto res = PQsendQuery(GetConn(), sent_queries.c_str());
 	if (res == 0) {
 		throw std::runtime_error("Failed to execute query \"" + queries + "\": " + string(PQerrorMessage(GetConn())));
 	}
@@ -216,18 +266,24 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                       .time_since_epoch()
 	                       .count();
 	MarkAnswered();
-	DUCKDB_LOG(context, PostgresQueryLogType, queries, end_time - start_time);
+	DUCKDB_LOG(context, PostgresQueryLogType, sent_queries, end_time - start_time);
 	return results;
 }
 
 vector<PostgresPipelineResult>
-PostgresConnection::ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements) {
+PostgresConnection::ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &requested) {
 	auto now = [] {
 		return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 		    .time_since_epoch()
 		    .count();
 	};
 	lock_guard<mutex> guard(connection_lock);
+	vector<PostgresPipelineStatement> statements;
+	for (auto &statement : TakeDeferred()) {
+		statements.push_back({std::move(statement), PostgresParameters()});
+	}
+	auto deferred_count = statements.size();
+	statements.insert(statements.end(), requested.begin(), requested.end());
 	auto conn = GetConn();
 	if (!PQenterPipelineMode(conn)) {
 		throw std::runtime_error("Failed to enter pipeline mode: " + string(PQerrorMessage(conn)));
@@ -289,6 +345,8 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 	if (!error_message.empty()) {
 		throw std::runtime_error(error_message);
 	}
+	// the deferred statements were not requested by the caller
+	results.erase(results.begin(), results.begin() + MinValue<idx_t>(deferred_count, results.size()));
 	return results;
 }
 
@@ -400,6 +458,32 @@ void PostgresConnection::NoteStatements(const string &sql) {
 	}
 }
 
+void PostgresConnection::Defer(string statement) {
+	lock_guard<mutex> guard(connection_lock);
+	deferred.push_back(std::move(statement));
+}
+
+void PostgresConnection::DeferBegin(string begin) {
+	lock_guard<mutex> guard(connection_lock);
+	deferred.insert(deferred.begin(), std::move(begin));
+	begin_deferred = true;
+}
+
+bool PostgresConnection::CancelDeferred() {
+	lock_guard<mutex> guard(connection_lock);
+	auto result = begin_deferred;
+	deferred.clear();
+	begin_deferred = false;
+	return result;
+}
+
+vector<string> PostgresConnection::TakeDeferred() {
+	begin_deferred = false;
+	auto result = std::move(deferred);
+	deferred.clear();
+	return result;
+}
+
 void PostgresConnection::NoteSessionChanged() {
 	session_changed = true;
 }
@@ -456,6 +540,8 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 		throw InternalException("Cannot reset a connection that is not open");
 	}
 	PGconn *conn = GetConn();
+	deferred.clear();
+	begin_deferred = false;
 	auto tx_status = PQtransactionStatus(conn);
 	if (tx_status == PQTRANS_INTRANS || tx_status == PQTRANS_INERROR) {
 		PGresult *res = PQexec(conn, "ROLLBACK");

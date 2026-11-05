@@ -11,6 +11,7 @@ namespace duckdb {
 struct PostgresExecutePipelineBindData : public TableFunctionData {
 	string catalog_name;
 	vector<PostgresPipelineStatement> statements;
+	bool commit = false;
 };
 
 struct PostgresExecutePipelineState : public GlobalTableFunctionState {
@@ -41,6 +42,10 @@ static unique_ptr<FunctionData> PostgresExecutePipelineBind(ClientContext &conte
 	auto result = make_uniq<PostgresExecutePipelineBindData>();
 	result->catalog_name = input.inputs[0].GetValue<string>();
 	result->statements = ExtractStatements(input.inputs[1]);
+	auto commit = input.named_parameters.find(Identifier("commit"));
+	if (commit != input.named_parameters.end() && !commit->second.IsNull()) {
+		result->commit = BooleanValue::Get(commit->second);
+	}
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rowcount");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -55,7 +60,11 @@ static unique_ptr<GlobalTableFunctionState> PostgresExecutePipelineInit(ClientCo
 	auto &transaction = Transaction::Get(context, catalog).Cast<PostgresTransaction>();
 	auto result = make_uniq<PostgresExecutePipelineState>();
 	// executed here and not at bind, so that EXPLAIN does not run the statements
-	result->results = transaction.GetConnection().ExecutePipeline(context, data.statements);
+	if (data.commit) {
+		result->results = transaction.ExecutePipelineAndCommit(context, data.statements);
+	} else {
+		result->results = transaction.GetConnection().ExecutePipeline(context, data.statements);
+	}
 	return std::move(result);
 }
 
@@ -76,9 +85,17 @@ static LogicalType PipelineStatementsType() {
 	return LogicalType::LIST(LogicalType::STRUCT(std::move(statement)));
 }
 
+static FunctionSignature PostgresExecutePipelineSignature() {
+	FunctionSignature signature;
+	signature.AddParameter("database", LogicalType::VARCHAR)
+	    .AddParameter("statements", PipelineStatementsType())
+	    .WithTypedKwargs("options", [&](TypedKwargs &options) { options.Add("commit", LogicalType::BOOLEAN); });
+	return signature;
+}
+
 PostgresExecutePipelineFunction::PostgresExecutePipelineFunction()
-    : TableFunction("postgres_execute_pipeline", {LogicalType::VARCHAR, PipelineStatementsType()},
-                    PostgresExecutePipelineScan, PostgresExecutePipelineBind, PostgresExecutePipelineInit) {
+    : TableFunction("postgres_execute_pipeline", PostgresExecutePipelineSignature(), PostgresExecutePipelineScan,
+                    PostgresExecutePipelineBind, PostgresExecutePipelineInit) {
 }
 
 } // namespace duckdb

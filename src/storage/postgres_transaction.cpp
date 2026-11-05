@@ -130,6 +130,25 @@ unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const st
 	return con.Query(GetContext(), query);
 }
 
+vector<PostgresPipelineResult>
+PostgresTransaction::ExecutePipelineAndCommit(ClientContext &context,
+                                              const vector<PostgresPipelineStatement> &statements) {
+	auto &con = GetConnection();
+	try {
+		auto results = con.ExecutePipeline(context, statements, true);
+		// what follows in this transaction begins a new one on the server
+		transaction_state = PostgresTransactionState::TRANSACTION_NOT_YET_STARTED;
+		return results;
+	} catch (...) {
+		// the COMMIT rolled back if a statement failed: the transaction is over unless the server still has it open
+		auto status = PQtransactionStatus(con.GetConn());
+		if (status != PQTRANS_INTRANS && status != PQTRANS_INERROR) {
+			transaction_state = PostgresTransactionState::TRANSACTION_NOT_YET_STARTED;
+		}
+		throw;
+	}
+}
+
 vector<unique_ptr<PostgresResult>> PostgresTransaction::ExecuteQueries(ClientContext &context, const string &queries) {
 	auto &con = GetConnectionRaw();
 	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {

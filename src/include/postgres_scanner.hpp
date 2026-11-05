@@ -79,9 +79,14 @@ public:
 
 	//! Statement prepared by postgres_query's bind to describe the query result
 	unique_ptr<PostgresPreparedStatement> prepared_statement;
+	//! The result of the query, run by postgres_query's bind when asked to, for the first scan to read
+	mutable unique_ptr<PostgresResult> bind_result;
+	mutable mutex bind_result_lock;
 
 public:
 	void SetTablePages(idx_t approx_num_pages);
+	//! The result that bind got for the query, once, if the scan runs the same query
+	unique_ptr<PostgresResult> TakeBindResult(const string &query) const;
 
 	unique_ptr<FunctionData> Copy() const override {
 		throw NotImplementedException("");

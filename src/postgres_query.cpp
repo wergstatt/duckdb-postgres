@@ -213,6 +213,21 @@ static unique_ptr<PostgresPreparedStatement> PrepareNamed(PostgresConnection &co
 	return make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
 }
 
+//! Whether pg_execute_in_bind runs the query at bind, which it does for queries but not for the commands of a pushdown
+static bool ExecuteInBindByDefault(ClientContext &context, TableFunctionBindInput &input) {
+	Value setting;
+	if (!context.TryGetCurrentSetting("pg_execute_in_bind", setting) || setting.IsNull() ||
+	    !BooleanValue::Get(setting)) {
+		return false;
+	}
+	for (auto command_flag : {"return_changed_rows", "suppress_dml_output"}) {
+		if (input.named_parameters.find(Identifier(command_flag)) != input.named_parameters.end()) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -266,19 +281,38 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 		               PostgresParameters::Text(std::move(param_values)), nullptr);
 	}
 
+	// the result of the query, when bind runs it instead of describing it
+	unique_ptr<PostgresResult> bind_result;
+	auto explicit_execute_in_bind = input.named_parameters.find(Identifier("execute_in_bind")) != input.named_parameters.end();
+	auto execute_in_bind = ExtractFlag(input, "execute_in_bind", ExecuteInBindByDefault(context, input));
 	auto conn_lock = con.Lock();
 	// the result types and names of the query
-	PostgresResult describe_wrapper(DescribeUnnamed(con, sql));
-	auto describe_prepared = describe_wrapper.res;
+	PostgresResult describe_wrapper(execute_in_bind ? nullptr : DescribeUnnamed(con, sql));
 	conn_lock.unlock();
-	int nparams = PQnparams(describe_prepared);
+	if (execute_in_bind) {
+		bind_result = con.Query(context, sql, PostgresParameters::Text(param_values), 1);
+		if (PQnfields(bind_result->res) <= 0) {
+			if (explicit_execute_in_bind) {
+				throw BinderException("execute_in_bind requires a query that returns columns: \"%s\"", sql);
+			}
+			// a command that ran already, the scan returns its row count
+			auto dml = BindDML(context, input, return_types, names, catalog, con, std::move(preliminary_queries),
+			                   sql, use_transaction, pinned_connection_id,
+			                   PostgresParameters::Text(std::move(param_values)), nullptr);
+			dml->Cast<PostgresBindData>().bind_result = std::move(bind_result);
+			return dml;
+		}
+	}
+	auto describe_prepared = execute_in_bind ? bind_result->res : describe_wrapper.res;
+	int nparams = execute_in_bind ? NumericCast<int>(param_values.size()) : PQnparams(describe_prepared);
 	if (nparams != param_values.size()) {
 		throw BinderException("Incorrect number of parameters specified, expected: %d, actual: %zu, query: \"%s\"",
 		                      nparams, param_values.size(), sql);
 	}
 	vector<Oid> param_types;
 	for (idx_t p = 0; p < nparams; p++) {
-		Oid ptype = PQparamtype(describe_prepared, p);
+		// without a description the server infers the types, as for the text parameters it ran the query with
+		Oid ptype = execute_in_bind ? 0 : PQparamtype(describe_prepared, p);
 		param_types.emplace_back(ptype);
 	}
 	int nfields = PQnfields(describe_prepared);
@@ -323,10 +357,17 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	result->preliminary_queries = std::move(preliminary_queries);
 	result->sql = std::move(sql);
 	result->query_mode = ResolveQueryMode(context, input, param_values);
-	result->params = PostgresParameters(std::move(param_types), std::move(param_values));
+	result->params = execute_in_bind ? PostgresParameters::Text(std::move(param_values))
+	                                 : PostgresParameters(std::move(param_types), std::move(param_values));
 	result->use_transaction = use_transaction;
 	result->clear_catalog_cache = ExtractFlag(input, "clear_catalog_cache", false);
 	PostgresScanFunction::PrepareBind(catalog.GetPostgresVersion(), context, *result, 0, catalog);
+	if (bind_result) {
+		// the scan reads the result instead of running the query again
+		result->query_mode = PostgresQueryMode::PLAIN_QUERY_BINARY;
+		result->bind_result = std::move(bind_result);
+		return std::move(result);
+	}
 	// a plain query can execute a statement prepared here, a COPY sends the query itself
 	if (result->query_mode == PostgresQueryMode::PLAIN_QUERY_BINARY || result->use_text_protocol) {
 		result->prepared_statement = PrepareNamed(con, pool_connection_id, result->sql);
@@ -360,6 +401,7 @@ static FunctionSignature PostgresQuerySignature(bool suppress_dml_output) {
 		    options.Add("preliminary_queries", LogicalType::LIST(LogicalType::VARCHAR));
 		    options.Add("clear_catalog_cache", LogicalType::BOOLEAN);
 		    options.Add("return_changed_rows", LogicalType::BOOLEAN);
+		    options.Add("execute_in_bind", LogicalType::BOOLEAN);
 	    });
 	return signature;
 }

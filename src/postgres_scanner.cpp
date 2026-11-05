@@ -167,6 +167,14 @@ PostgresBindData::PostgresBindData(ClientContext &context, const Identifier &cat
 	}
 }
 
+unique_ptr<PostgresResult> PostgresBindData::TakeBindResult(const string &query) const {
+	lock_guard<mutex> guard(bind_result_lock);
+	if (query != sql) {
+		return nullptr;
+	}
+	return std::move(bind_result);
+}
+
 void PostgresBindData::SetTablePages(idx_t approx_num_pages) {
 	this->pages_approx = approx_num_pages;
 	if (!read_only || use_text_protocol) {
@@ -412,7 +420,10 @@ static unique_ptr<GlobalTableFunctionState> PostgresInitGlobalState(ClientContex
 		// fire it — and hand back a rowcount result through the materialized-collection
 		// fast path (PostgresScan returns gstate.collection directly, and GetLocalState short-circuits
 		// when a collection is present, so no postgres scan connection is opened).
-		unique_ptr<PostgresResult> pg_res = con.Query(context, bind_data.sql, bind_data.params);
+		auto pg_res = bind_data.TakeBindResult(bind_data.sql);
+		if (!pg_res) {
+			pg_res = con.Query(context, bind_data.sql, bind_data.params);
+		}
 		HandleCatalogCache(context, bind_data);
 		vector<LogicalType> rowcount_types {LogicalType::BIGINT};
 		auto materialized = make_uniq<ColumnDataCollection>(Allocator::Get(context), rowcount_types);

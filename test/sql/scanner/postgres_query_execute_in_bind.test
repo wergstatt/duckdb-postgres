@@ -1,0 +1,48 @@
+# name: test/sql/scanner/postgres_query_execute_in_bind.test
+# description: postgres_query runs the query at bind when asked, instead of describing it first
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES);
+
+statement ok
+CALL enable_logging('PostgresQueryLog');
+
+query II
+FROM postgres_query('s', 'SELECT $1::INTEGER + 1 AS i, ''execute in bind'' AS s', params := [41], execute_in_bind := true)
+----
+42	execute in bind
+
+# the scan reads the result of bind, the query reaches the server once and not as a COPY
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE '%execute in bind%'
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE 'COPY%execute in bind%'
+----
+0
+
+statement error
+FROM postgres_query('s', 'SET LOCAL work_mem = ''64MB''', execute_in_bind := true)
+----
+execute_in_bind requires a query that returns columns
+
+# the setting runs the queries of postgres_query at bind
+statement ok
+SET pg_execute_in_bind = true
+
+query I
+FROM postgres_query('s', 'SELECT ''by setting'' AS s')
+----
+by setting
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE 'SELECT%by setting%'
+----
+1

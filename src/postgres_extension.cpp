@@ -292,6 +292,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "effective. " +
 	        CreatePoolNote("enable_reaper_thread=TRUE"),
 	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.start_reaper_thread), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_execute_in_bind",
+	                          "Whether postgres_query runs a query when it is bound, which saves the round trip that "
+	                          "describes its result. A query that is bound but not executed, such as in EXPLAIN, runs "
+	                          "as well",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("pg_pool_health_check_query",
 	                          "The query that is used to check that the connection is healthy. Setting this option to "
 	                          "an empty string disables the health check. " +

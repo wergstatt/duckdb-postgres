@@ -48,6 +48,17 @@ FROM postgres_execute_pipeline('s1', [
 ----
 invalid input syntax for type integer
 
+# the error names its SQLSTATE, which doesn't depend on the language of the server
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'INSERT INTO pipeline_tbl VALUES ($1)', 'params': ['not a number']}])
+----
+(SQLSTATE 22P02)
+
+statement error
+CALL postgres_execute('s1', 'INSERT INTO pipeline_tbl VALUES (''not a number'')', prepare=FALSE)
+----
+(SQLSTATE 22P02)
+
 query I
 FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
 ----

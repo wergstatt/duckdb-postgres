@@ -16,6 +16,17 @@ namespace duckdb {
 
 static bool debug_postgres_print_queries = false;
 
+//! The error of a result with its SQLSTATE, by which callers can tell errors apart in any server language
+static string ResultErrorMessage(PGresult *result) {
+	string message = PQresultErrorMessage(result);
+	StringUtil::RTrim(message);
+	auto sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+	if (sqlstate) {
+		message += string(" (SQLSTATE ") + sqlstate + ")";
+	}
+	return message;
+}
+
 PostgresConnection::PostgresConnection(PGconn *connection_p) : connection(connection_p) {
 }
 
@@ -98,8 +109,8 @@ unique_ptr<PostgresResult> PostgresConnection::TryQuery(optional_ptr<ClientConte
 
 	if (ResultHasError(result)) {
 		if (error_message) {
-			auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
-			*error_message = StringUtil::Format("Failed to execute query \"" + query + "\": " + string(error));
+			auto error = result ? ResultErrorMessage(result) : string(PQerrorMessage(GetConn()));
+			*error_message = StringUtil::Format("Failed to execute query \"" + query + "\": " + error);
 		}
 		PQclear(result);
 		return nullptr;
@@ -141,9 +152,9 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 	}
 
 	if (ResultHasError(result)) {
-		auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(conn);
+		auto error = result ? ResultErrorMessage(result) : string(PQerrorMessage(conn));
 		auto error_message = StringUtil::Format("Failed to execute prepared statement \"%s\" for query \"%s\": %s",
-		                                        stmt.GetName(), query, string(error));
+		                                        stmt.GetName(), query, error);
 		PQclear(result);
 		throw std::runtime_error(error_message);
 	}
@@ -177,7 +188,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 		auto result = make_uniq<PostgresResult>(res);
 		if (ResultHasError(res)) {
 			if (error_message.empty()) {
-				error_message = "Failed to execute query \"" + queries + "\": " + string(PQresultErrorMessage(res));
+				error_message = "Failed to execute query \"" + queries + "\": " + ResultErrorMessage(res);
 			}
 			continue;
 		}
@@ -241,8 +252,8 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 				executed = true;
 			} else if (status != PGRES_PIPELINE_ABORTED) {
 				if (error_message.empty()) {
-					error_message = "Failed to execute query \"" + statements[i].query +
-					                "\": " + string(PQresultErrorMessage(result));
+					error_message =
+					    "Failed to execute query \"" + statements[i].query + "\": " + ResultErrorMessage(result);
 				}
 				executed = true;
 			}

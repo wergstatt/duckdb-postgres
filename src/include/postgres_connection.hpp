@@ -65,9 +65,9 @@ public:
 	//! Submits a set of queries to be executed in the connection.
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
 	//! Executes statements in one round trip and returns the result of each. A failed statement skips the statements
-	//! after it, and its error names its position and SQLSTATE
-	vector<PostgresPipelineResult> ExecutePipeline(ClientContext &context,
-	                                               const vector<PostgresPipelineStatement> &statements);
+	//! after it, and its error names its position and SQLSTATE. With commit, a COMMIT follows them in the round trip
+	vector<PostgresPipelineResult>
+	ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements, bool commit = false);
 
 	PostgresVersion GetPostgresVersion(ClientContext &context);
 

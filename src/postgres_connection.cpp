@@ -197,15 +197,23 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	return results;
 }
 
-vector<PostgresPipelineResult>
-PostgresConnection::ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements) {
+vector<PostgresPipelineResult> PostgresConnection::ExecutePipeline(ClientContext &context,
+                                                                   const vector<PostgresPipelineStatement> &statements,
+                                                                   bool commit) {
 	auto now = [] {
 		return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 		    .time_since_epoch()
 		    .count();
 	};
-	auto name = [](idx_t i) {
-		return StringUtil::Format("statement %d of the pipeline", i + 1);
+	// with commit, a COMMIT follows the statements after a sync, so it runs even after a failed statement and then
+	// rolls back; errors name it by its query
+	PostgresPipelineStatement commit_statement {"COMMIT", PostgresParameters()};
+	auto count = statements.size() + (commit ? 1 : 0);
+	auto statement_at = [&](idx_t i) -> const PostgresPipelineStatement & {
+		return i < statements.size() ? statements[i] : commit_statement;
+	};
+	auto name = [&](idx_t i) {
+		return i < statements.size() ? StringUtil::Format("statement %d of the pipeline", i + 1) : string("query");
 	};
 	lock_guard<mutex> guard(connection_lock);
 	auto conn = GetConn();
@@ -215,14 +223,16 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 	auto previous = now();
 	string error_message;
 	idx_t sent = 0;
-	for (; sent < statements.size(); sent++) {
-		auto &statement = statements[sent];
+	for (; sent < count; sent++) {
+		auto &statement = statement_at(sent);
 		if (PostgresConnection::DebugPrintQueries()) {
 			Printer::Print(statement.query + "\n");
 		}
 		auto &params = statement.params;
+		auto synced = sent < statements.size() || PQpipelineSync(conn);
 		// the flush request makes the server send each result as soon as its statement ran, not at the end
-		if (!PQsendQueryParams(conn, statement.query.c_str(), params.Count(), params.Types(), params.Values(),
+		if (!synced ||
+		    !PQsendQueryParams(conn, statement.query.c_str(), params.Count(), params.Types(), params.Values(),
 		                       params.Lengths(), params.Formats(), 0) ||
 		    !PQsendFlushRequest(conn)) {
 			error_message = StringUtil::Format("Failed to send %s \"%s\": %s", name(sent), statement.query,
@@ -234,8 +244,14 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 		error_message = "Failed to send pipeline: " + string(PQerrorMessage(conn));
 	}
 	vector<PostgresPipelineResult> results;
+	// a statement the server failed makes it skip to the sync, so the COMMIT after it cannot have committed
+	bool failed_before_commit = false;
 	for (idx_t i = 0; i < sent; i++) {
-		auto &statement = statements[i];
+		auto &statement = statement_at(i);
+		if (i == statements.size()) {
+			// the result of the sync before COMMIT
+			PQclear(PQgetResult(conn));
+		}
 		bool executed = false;
 		// the results of each statement end with a NULL
 		while (auto result = PQgetResult(conn)) {
@@ -256,6 +272,10 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 					error_message = StringUtil::Format("Failed to execute %s \"%s\": %s", name(i), statement.query,
 					                                   PostgresUtils::ErrorMessage(conn, result));
 				}
+				// only errors of the server carry a SQLSTATE, not those of a lost connection
+				if (i < statements.size() && PQresultErrorField(result, PG_DIAG_SQLSTATE)) {
+					failed_before_commit = true;
+				}
 				executed = true;
 			}
 			PQclear(result);
@@ -271,6 +291,17 @@ PostgresConnection::ExecutePipeline(ClientContext &context, const vector<Postgre
 	PQclear(PQgetResult(conn));
 	if (!PQexitPipelineMode(conn) && error_message.empty()) {
 		error_message = "Failed to leave pipeline mode: " + string(PQerrorMessage(conn));
+	}
+	if (commit && results.size() == count) {
+		// the transaction committed, whatever failed after its COMMIT
+		results.pop_back();
+		return results;
+	}
+	if (commit && !failed_before_commit && sent + 1 >= count && PQstatus(conn) == CONNECTION_BAD) {
+		// the server may have run the COMMIT that went out
+		throw std::runtime_error("Lost the connection after sending COMMIT, so whether the transaction committed is "
+		                         "unknown (SQLSTATE 08007): " +
+		                         error_message);
 	}
 	if (!error_message.empty()) {
 		throw std::runtime_error(error_message);

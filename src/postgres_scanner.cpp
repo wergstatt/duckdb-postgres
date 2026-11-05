@@ -167,6 +167,14 @@ PostgresBindData::PostgresBindData(ClientContext &context, const Identifier &cat
 	}
 }
 
+unique_ptr<PostgresResult> PostgresBindData::TakeBindResult(const string &query) const {
+	lock_guard<mutex> guard(bind_result_lock);
+	if (query != sql) {
+		return nullptr;
+	}
+	return std::move(bind_result);
+}
+
 void PostgresBindData::SetTablePages(idx_t approx_num_pages) {
 	this->pages_approx = approx_num_pages;
 	if (!read_only || use_text_protocol) {

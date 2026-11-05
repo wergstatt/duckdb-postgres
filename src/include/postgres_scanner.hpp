@@ -23,6 +23,9 @@ struct PostgresLocalState;
 struct PostgresGlobalState;
 class PostgresTransaction;
 
+//! Whether a column of this type is read by casting it to VARCHAR in the query, as its binary format is not read
+bool ContainsCastToVarchar(const PostgresType &type);
+
 struct PostgresBindData : public FunctionData {
 	static constexpr const idx_t DEFAULT_PAGES_PER_TASK = 1000;
 
@@ -79,9 +82,18 @@ public:
 
 	//! Statement prepared by postgres_query's bind to describe the query result
 	unique_ptr<PostgresPreparedStatement> prepared_statement;
+	//! Set by postgres_query when its bind runs the query (execute_in_bind), the scan reads the result of bind
+	bool execute_in_bind = false;
+	//! The result of the query run by bind, with all its columns, for the first scan to read
+	mutable unique_ptr<PostgresResult> bind_result;
+	//! The query number of the statement that ran the query in bind, the result is only read by a scan in it
+	idx_t bind_query = 0;
+	mutable mutex bind_result_lock;
 
 public:
 	void SetTablePages(idx_t approx_num_pages);
+	//! The result that bind got for the query, once, if the scan runs in the statement that bound it
+	unique_ptr<PostgresResult> TakeBindResult(ClientContext &context) const;
 
 	unique_ptr<FunctionData> Copy() const override {
 		throw NotImplementedException("");

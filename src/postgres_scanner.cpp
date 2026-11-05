@@ -167,6 +167,18 @@ PostgresBindData::PostgresBindData(ClientContext &context, const Identifier &cat
 	}
 }
 
+unique_ptr<PostgresResult> PostgresBindData::TakeBindResult(ClientContext &context) const {
+	if (!execute_in_bind) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(bind_result_lock);
+	if (bind_result && bind_query != context.transaction.GetActiveQuery()) {
+		// a prepared statement, bound by an earlier statement: the data may be out of date, run the query again
+		bind_result.reset();
+	}
+	return std::move(bind_result);
+}
+
 void PostgresBindData::SetTablePages(idx_t approx_num_pages) {
 	this->pages_approx = approx_num_pages;
 	if (!read_only || use_text_protocol) {
@@ -208,7 +220,7 @@ static unique_ptr<FunctionData> PostgresBind(ClientContext &, TableFunctionBindI
 	throw InternalException("PostgresBind");
 }
 
-static bool ContainsCastToVarchar(const PostgresType &type) {
+bool ContainsCastToVarchar(const PostgresType &type) {
 	if (type.info == PostgresTypeAnnotation::CAST_TO_VARCHAR) {
 		return true;
 	}

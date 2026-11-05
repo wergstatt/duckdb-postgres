@@ -11,11 +11,17 @@ namespace duckdb {
 
 struct ClearCacheFunctionData : public TableFunctionData {
 	bool finished = false;
+	//! The catalog whose cache is cleared, all Postgres catalogs if empty
+	string catalog_name;
 };
 
 static unique_ptr<FunctionData> ClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ClearCacheFunctionData>();
+	auto catalog = input.named_parameters.find(Identifier("catalog"));
+	if (catalog != input.named_parameters.end() && !catalog->second.IsNull()) {
+		result->catalog_name = StringValue::Get(catalog->second);
+	}
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 	return std::move(result);
@@ -38,7 +44,12 @@ static void ClearCacheFunction(ClientContext &context, TableFunctionInput &data_
 	if (data.finished) {
 		return;
 	}
-	PostgresClearCacheFunction::ClearPostgresCaches(context);
+	if (data.catalog_name.empty()) {
+		PostgresClearCacheFunction::ClearPostgresCaches(context);
+	} else {
+		auto attached_catalog = PostgresCatalog::Lookup(context, Identifier(data.catalog_name));
+		attached_catalog.Get<PostgresCatalog>().ClearCache();
+	}
 	data.finished = true;
 }
 
@@ -46,7 +57,13 @@ void PostgresClearCacheFunction::ClearCacheOnSetting(ClientContext &context, Set
 	PostgresClearCacheFunction::ClearPostgresCaches(context);
 }
 
+static FunctionSignature ClearCacheSignature() {
+	FunctionSignature signature;
+	signature.WithTypedKwargs("options", [&](TypedKwargs &options) { options.Add("catalog", LogicalType::VARCHAR); });
+	return signature;
+}
+
 PostgresClearCacheFunction::PostgresClearCacheFunction()
-    : TableFunction("postgres_clear_cache", {}, ClearCacheFunction, ClearCacheBind) {
+    : TableFunction("postgres_clear_cache", ClearCacheSignature(), ClearCacheFunction, ClearCacheBind) {
 }
 } // namespace duckdb

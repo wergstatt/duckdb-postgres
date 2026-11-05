@@ -68,6 +68,8 @@ public:
 
 	bool IsOpen();
 	void Close();
+	//! Whether the server answered on this connection within the last milliseconds
+	bool AnsweredWithin(uint64_t milliseconds) const;
 	bool PingServer(const std::string &health_check_query);
 	void Reset(const std::string &health_check_query);
 
@@ -96,8 +98,12 @@ private:
 	//! Requires connection_lock to be held
 	bool PingServerInternal(const std::string &health_check_query);
 
+	//! Notes that the server answered
+	void MarkAnswered();
+
 	PGconn *connection = nullptr;
 	mutex connection_lock;
+	std::chrono::steady_clock::time_point last_answer;
 	string dsn;
 };
 

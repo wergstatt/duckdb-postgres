@@ -154,6 +154,10 @@ DETACH s
 
 # health check query
 
+# run the health check every time a connection is taken from or returned to the pool
+statement ok
+SET pg_pool_health_check_interval_millis = 0
+
 statement ok
 ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES);
 

@@ -1,0 +1,45 @@
+# name: test/sql/connection_pool/connection_pool_reset.test
+# description: A pooled connection is reset only if its session changed
+# group: [connection_pool]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner application_name=pool_reset' AS s (TYPE POSTGRES);
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS observer (TYPE POSTGRES);
+
+query I
+FROM postgres_query('s', 'SELECT 42')
+----
+42
+
+# the session did not change, so the connection went back to the pool without a DISCARD ALL
+query I
+SELECT query <> 'DISCARD ALL'
+FROM postgres_query('observer', 'SELECT query FROM pg_stat_activity WHERE application_name = ''pool_reset''')
+----
+true
+
+# a setting changes the session, so the connection is reset
+statement ok
+CALL postgres_execute('s', 'SET statement_timeout = 12345')
+
+query I
+FROM postgres_query('s', 'SELECT current_setting(''statement_timeout'')')
+----
+0
+
+# so does a named statement that was left open
+statement error
+FROM postgres_query('s', 'SELECT 42', params=row(1))
+----
+Incorrect number of parameters
+
+query I
+FROM postgres_query('s', 'SELECT count(*) FROM pg_prepared_statements')
+----
+0

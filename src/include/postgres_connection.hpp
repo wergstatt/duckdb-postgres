@@ -68,6 +68,15 @@ public:
 
 	bool IsOpen();
 	void Close();
+	//! Sends a statement with the next request on this connection, instead of in a round trip of its own
+	void Defer(string statement);
+	//! Sends BEGIN with the next request, so that a transaction that sends nothing does not reach the server
+	void DeferBegin(string begin);
+	//! Drops a deferred BEGIN that no other statement follows, returns whether it did
+	bool CancelBegin();
+	//! Sends the deferred statements in a round trip of their own, ahead of a request that cannot carry them. The
+	//! connection lock must be held
+	void ExecuteDeferred(optional_ptr<ClientContext> context);
 	bool PingServer(const std::string &health_check_query);
 	void Reset(const std::string &health_check_query);
 
@@ -95,9 +104,16 @@ private:
 	                    const PostgresParameters &params = PostgresParameters(), int format = 0);
 	//! Requires connection_lock to be held
 	bool PingServerInternal(const std::string &health_check_query);
+	//! Returns the query with the deferred statements ahead of it, to send them in the same plain query. Requires
+	//! connection_lock to be held
+	string PrependDeferred(const string &query);
 
 	PGconn *connection = nullptr;
 	mutex connection_lock;
+	//! The statements to send with the next request
+	vector<string> deferred;
+	//! Whether the BEGIN of a transaction is among the deferred statements
+	bool begin_deferred = false;
 	string dsn;
 };
 

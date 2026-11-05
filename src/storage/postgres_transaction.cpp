@@ -31,7 +31,10 @@ void PostgresTransaction::Start() {
 void PostgresTransaction::Commit() {
 	if (transaction_state == PostgresTransactionState::TRANSACTION_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
-		GetConnectionRaw().Execute(GetContext(), "COMMIT");
+		// a transaction that sent nothing has nothing to commit, otherwise COMMIT carries what is still deferred
+		if (!GetConnectionRaw().CancelBegin()) {
+			GetConnectionRaw().Execute(GetContext(), "COMMIT");
+		}
 	}
 	vector<pair<reference<PostgresCatalogSet>, string>> to_promote;
 	{
@@ -45,7 +48,9 @@ void PostgresTransaction::Commit() {
 void PostgresTransaction::Rollback() {
 	if (transaction_state == PostgresTransactionState::TRANSACTION_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
-		GetConnectionRaw().Execute(GetContext(), "ROLLBACK");
+		if (!GetConnectionRaw().CancelBegin()) {
+			GetConnectionRaw().Execute(GetContext(), "ROLLBACK");
+		}
 	}
 	lock_guard<mutex> l(pending_signatures_lock);
 	pending_signatures.clear();
@@ -90,8 +95,8 @@ PostgresConnection &PostgresTransaction::GetConnection() {
 	auto &con = GetConnectionRaw();
 	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string query = GetBeginTransactionQuery();
-		con.Execute(GetContext(), query);
+		// BEGIN goes with the first statement of the transaction
+		con.DeferBegin(GetBeginTransactionQuery());
 	}
 	return con;
 }
@@ -109,14 +114,7 @@ string PostgresTransaction::GetDSN() {
 }
 
 unique_ptr<PostgresResult> PostgresTransaction::Query(const string &query) {
-	auto &con = GetConnectionRaw();
-	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string transaction_start = GetBeginTransactionQuery();
-		transaction_start += ";\n";
-		return con.Query(GetContext(), transaction_start + query);
-	}
-	return con.Query(GetContext(), query);
+	return GetConnection().Query(GetContext(), query);
 }
 
 unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const string &query) {
@@ -131,14 +129,7 @@ unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const st
 }
 
 vector<unique_ptr<PostgresResult>> PostgresTransaction::ExecuteQueries(ClientContext &context, const string &queries) {
-	auto &con = GetConnectionRaw();
-	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string transaction_start = GetBeginTransactionQuery();
-		transaction_start += ";\n";
-		return con.ExecuteQueries(context, transaction_start + queries);
-	}
-	return con.ExecuteQueries(context, queries);
+	return GetConnection().ExecuteQueries(context, queries);
 }
 
 optional_ptr<CatalogEntry> PostgresTransaction::ReferenceEntry(shared_ptr<CatalogEntry> &entry) {

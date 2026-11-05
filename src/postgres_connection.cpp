@@ -94,7 +94,14 @@ unique_ptr<PostgresResult> PostgresConnection::TryQuery(optional_ptr<ClientConte
                                                         optional_ptr<string> error_message,
                                                         const PostgresParameters &params, int format) {
 	lock_guard<mutex> guard(connection_lock);
-	auto result = PQExecute(context, query.c_str(), params, format);
+	auto sent_query = query;
+	if (params.Empty() && format == 0) {
+		// a plain query can hold several statements, so the deferred ones go with it
+		sent_query = PrependDeferred(query);
+	} else {
+		ExecuteDeferred(context);
+	}
+	auto result = PQExecute(context, sent_query, params, format);
 
 	if (ResultHasError(result)) {
 		if (error_message) {
@@ -131,6 +138,7 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 	                         .count();
 
 	lock_guard<mutex> guard(connection_lock);
+	ExecuteDeferred(context);
 	PGconn *conn = GetConn();
 	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
 	                                  params.Formats(), format);
@@ -165,7 +173,8 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                         .time_since_epoch()
 	                         .count();
 	lock_guard<mutex> guard(connection_lock);
-	auto res = PQsendQuery(GetConn(), queries.c_str());
+	auto sent_queries = PrependDeferred(queries);
+	auto res = PQsendQuery(GetConn(), sent_queries.c_str());
 	if (res == 0) {
 		throw std::runtime_error("Failed to execute query: " + string(PQerrorMessage(GetConn())));
 	}
@@ -194,7 +203,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
 	                       .count();
-	DUCKDB_LOG(context, PostgresQueryLogType, queries, end_time - start_time);
+	DUCKDB_LOG(context, PostgresQueryLogType, sent_queries, end_time - start_time);
 	return results;
 }
 
@@ -229,6 +238,49 @@ void PostgresConnection::Close() {
 	connection = nullptr;
 }
 
+void PostgresConnection::Defer(string statement) {
+	lock_guard<mutex> guard(connection_lock);
+	deferred.push_back(std::move(statement));
+}
+
+void PostgresConnection::DeferBegin(string begin) {
+	lock_guard<mutex> guard(connection_lock);
+	deferred.push_back(std::move(begin));
+	begin_deferred = true;
+}
+
+bool PostgresConnection::CancelBegin() {
+	lock_guard<mutex> guard(connection_lock);
+	if (!begin_deferred || deferred.size() > 1) {
+		return false;
+	}
+	deferred.clear();
+	begin_deferred = false;
+	return true;
+}
+
+string PostgresConnection::PrependDeferred(const string &query) {
+	deferred.push_back(query);
+	auto result = StringUtil::Join(deferred, ";\n");
+	deferred.clear();
+	begin_deferred = false;
+	return result;
+}
+
+void PostgresConnection::ExecuteDeferred(optional_ptr<ClientContext> context) {
+	if (deferred.empty()) {
+		return;
+	}
+	auto statements = StringUtil::Join(deferred, ";\n");
+	deferred.clear();
+	begin_deferred = false;
+	PostgresResult result(PQExecute(context, statements));
+	if (ResultHasError(result.res)) {
+		auto error = PostgresUtils::GetErrorMessage(result.res, GetConn());
+		throw std::runtime_error("Failed to execute query: " + string(error));
+	}
+}
+
 bool PostgresConnection::PingServer(const std::string &health_check_query) {
 	lock_guard<mutex> guard(connection_lock);
 	return PingServerInternal(health_check_query);
@@ -256,6 +308,8 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 		throw InternalException("Cannot reset a connection that is not open");
 	}
 	PGconn *conn = GetConn();
+	deferred.clear();
+	begin_deferred = false;
 	auto tx_status = PQtransactionStatus(conn);
 	if (tx_status == PQTRANS_INTRANS || tx_status == PQTRANS_INERROR) {
 		PGresult *res = PQexec(conn, "ROLLBACK");

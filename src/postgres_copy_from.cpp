@@ -6,7 +6,8 @@ namespace duckdb {
 
 void PostgresConnection::BeginCopyFrom(ClientContext &context, const string &query, ExecStatusType expected_result) {
 	lock_guard<mutex> guard(connection_lock);
-	PostgresResult pg_res(PQExecute(context, query.c_str()));
+	auto sent_query = PrependDeferred(query);
+	PostgresResult pg_res(PQExecute(context, sent_query));
 	auto result = pg_res.res;
 	if (!result || PQresultStatus(result) != expected_result) {
 		auto error = PostgresUtils::GetErrorMessage(result, GetConn());

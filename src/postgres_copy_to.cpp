@@ -63,7 +63,8 @@ void PostgresConnection::BeginCopyTo(ClientContext &context, PostgresCopyState &
 
 	{
 		lock_guard<mutex> guard(connection_lock);
-		PostgresResult pg_res(PQExecute(context, query.c_str()));
+		auto sent_query = PrependDeferred(query);
+		PostgresResult pg_res(PQExecute(context, sent_query));
 		auto result = pg_res.res;
 		if (!result || PQresultStatus(result) != PGRES_COPY_IN) {
 			auto error = PostgresUtils::GetErrorMessage(result, GetConn());

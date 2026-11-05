@@ -41,6 +41,8 @@ private:
 	data_ptr_t buffer = nullptr;
 	// plain mode
 	unique_ptr<PostgresResult> result;
+	//! The result was run by bind instead of a scan query, it has all the columns instead of the projected ones
+	bool result_of_bind = false;
 	idx_t row_offset = 0;
 };
 

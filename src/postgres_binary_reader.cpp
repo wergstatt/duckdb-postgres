@@ -26,7 +26,11 @@ PostgresBinaryReader::~PostgresBinaryReader() {
 
 void PostgresBinaryReader::BeginCopy(ClientContext &context, const string &sql) {
 	if (mode == PostgresBinaryReaderMode::PLAIN_QUERY) {
-		this->result = Query(context, sql, 1);
+		this->result = bind_data.TakeBindResult(context);
+		this->result_of_bind = this->result != nullptr;
+		if (!this->result) {
+			this->result = Query(context, sql, 1);
+		}
 		this->row_offset = 0;
 	} else {
 		// COPY does not use the statement, it must be closed before the connection enters the COPY state
@@ -123,13 +127,20 @@ PostgresReadResult PostgresBinaryReader::ReadPlain(DataChunk &output) {
 			auto col_idx = column_ids[output_idx];
 			auto &out_vec = output.data[output_idx];
 
-			if (result->IsNull(row_offset, output_idx)) {
+			// the result of bind has all the columns of the query, the result of a scan query only the projected ones
+			auto result_idx = result_of_bind ? col_idx : output_idx;
+			if (result_of_bind && col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+				// there is no row id in the result, the scan query selects NULL for it
+				FlatVector::SetNull(out_vec, output_offset, true);
+				continue;
+			}
+			if (result->IsNull(row_offset, result_idx)) {
 				FlatVector::SetNull(out_vec, output_offset, true);
 				continue;
 			}
 
 			// Obtain the raw binary data from the result cell
-			auto val = result->GetStringRef(row_offset, output_idx);
+			auto val = result->GetStringRef(row_offset, result_idx);
 			parser.SetBuffer(data_ptr_cast(val.GetDataWriteable()), val.GetSize());
 
 			if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {

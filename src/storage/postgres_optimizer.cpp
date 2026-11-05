@@ -78,6 +78,11 @@ static void OptimizePostgresScanLimitPushdown(unique_ptr<LogicalOperator> &op) {
 		}
 
 		auto &bind_data = get.bind_data->Cast<PostgresBindData>();
+		if (bind_data.execute_in_bind) {
+			// the scan reads the result of the query that bind ran, it does not apply a limit to it
+			OptimizePostgresScanLimitPushdown(op->children[0]);
+			return;
+		}
 
 		string generated_limit_clause = "";
 		if (limit.limit_val.Type() != LimitNodeType::UNSET) {

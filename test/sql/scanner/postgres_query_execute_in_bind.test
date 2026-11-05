@@ -1,0 +1,171 @@
+# name: test/sql/scanner/postgres_query_execute_in_bind.test
+# description: postgres_query runs the query at bind when asked, instead of describing it first
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+# the statements prepared in the session of the scan are only visible with a direct connection
+require-env POSTGRES_CONNECTION_IS_DIRECT
+
+statement ok
+SET TimeZone = 'UTC'
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+# the query is run as it is, no statement is prepared, and it reaches the server once
+query II
+FROM postgres_query('s', 'SELECT 1 AS i, count(*) AS prepared FROM pg_prepared_statements
+    WHERE statement LIKE ''%execute in bind option%''', execute_in_bind := true)
+----
+1	0
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE '%execute in bind option%'
+----
+1
+
+# the types and the rows are the ones of a query that is described first
+
+statement ok
+CALL postgres_execute('s', 'DROP TABLE IF EXISTS execute_in_bind_types')
+
+statement ok
+CALL postgres_execute('s', 'CREATE TABLE execute_in_bind_types (i INTEGER, n NUMERIC(10,2), t TEXT, tstz TIMESTAMPTZ,
+    b BOOLEAN, ba BYTEA, arr INTEGER[])')
+
+statement ok
+CALL postgres_execute('s', 'INSERT INTO execute_in_bind_types VALUES
+    (1, 12345.67, ''foo'', ''2020-01-02 03:04:05.678+00'', true, ''\xdeadbeef'', ''{1,2,NULL}''),
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (-2, -0.01, '''', ''1999-12-31 23:59:59+00'', false, '''', ''{}'')')
+
+query IIIIIII
+FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types ORDER BY i NULLS LAST', execute_in_bind := true)
+----
+-2	-0.01	(empty)	1999-12-31 23:59:59+00	false	(empty)	[]
+1	12345.67	foo	2020-01-02 03:04:05.678+00	true	\xDE\xAD\xBE\xEF	[1, 2, NULL]
+NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+query I
+SELECT count(*) FROM (
+    (FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types', execute_in_bind := true))
+    EXCEPT
+    (FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types'))
+    EXCEPT
+    (FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types', execute_in_bind := true))
+)
+----
+0
+
+# more rows than a vector, and no rows
+query II
+SELECT count(*), sum(i) FROM postgres_query('s', 'SELECT i::INTEGER FROM generate_series(1, 5000) i', execute_in_bind := true)
+----
+5000	12502500
+
+query I
+SELECT count(*) FROM postgres_query('s', 'SELECT 1::INTEGER AS i WHERE false', execute_in_bind := true)
+----
+0
+
+# parameters are sent as text
+query II
+FROM postgres_query('s', 'SELECT $1::INTEGER + 1 AS i, $2::TEXT AS t', params := row(41, NULL), execute_in_bind := true)
+----
+42	NULL
+
+# one column of a query with several
+query I
+SELECT t FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types WHERE i = 1', execute_in_bind := true)
+----
+foo
+
+statement error
+SELECT no_such_column FROM postgres_query('s', 'SELECT 1 AS i', execute_in_bind := true)
+----
+Binder Error: Referenced column "no_such_column" not found in FROM clause
+
+# a prepared statement of DuckDB reads the table as it is when it is executed, not as it was when it was prepared
+statement ok
+PREPARE p1 AS SELECT count(*) FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types', execute_in_bind := true)
+
+query I
+EXECUTE p1
+----
+3
+
+statement ok
+CALL postgres_execute('s', 'INSERT INTO execute_in_bind_types (i) VALUES (3)')
+
+query I
+EXECUTE p1
+----
+4
+
+statement ok
+DEALLOCATE p1
+
+# the query runs in the transaction of the scan, it sees the writes of the transaction
+statement ok
+BEGIN
+
+statement ok
+CALL postgres_execute('s', 'INSERT INTO execute_in_bind_types (i) VALUES (4)')
+
+query I
+SELECT count(*) FROM postgres_query('s', 'SELECT * FROM execute_in_bind_types', execute_in_bind := true)
+----
+5
+
+statement ok
+COMMIT
+
+# the option is not one of postgres_execute
+statement error
+CALL postgres_execute('s', 'SELECT 1', execute_in_bind := true)
+----
+execute_in_bind
+
+# rejected combinations
+statement error
+FROM postgres_query('s', 'SELECT 1', prepare := false, execute_in_bind := true)
+----
+execute_in_bind cannot be combined with prepare=FALSE
+
+# a type that the scan would read as VARCHAR
+statement error
+FROM postgres_query('s', 'SELECT ''127.0.0.1''::INET AS x', execute_in_bind := true)
+----
+Column "x" has a type that cannot be read in the binary format, cast it to TEXT in the query
+
+statement error
+FROM postgres_query('s', 'DO $$ BEGIN NULL; END $$', execute_in_bind := true)
+----
+execute_in_bind requires a query that returns columns
+
+# errors of the server are errors of bind
+statement error
+FROM postgres_query('s', 'SELECT * FROM execute_in_bind_no_such_table', execute_in_bind := true)
+----
+Binder Error: Failed to execute query "SELECT * FROM execute_in_bind_no_such_table": ERROR:  relation "execute_in_bind_no_such_table" does not exist
+
+statement error
+FROM postgres_query('s', 'SELECT 1 / 0', execute_in_bind := true)
+----
+Binder Error: Failed to execute query "SELECT 1 / 0": ERROR:  division by zero
+
+statement ok
+CALL postgres_execute('s', 'DROP TABLE execute_in_bind_types')

@@ -130,6 +130,24 @@ unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const st
 	return con.Query(GetContext(), query);
 }
 
+vector<PostgresPipelineResult>
+PostgresTransaction::ExecutePipelineAndCommit(ClientContext &context, vector<PostgresPipelineStatement> statements) {
+	auto begins = transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED;
+	if (begins) {
+		statements.insert(statements.begin(), {GetBeginTransactionQuery(), PostgresParameters()});
+	}
+	statements.push_back({"COMMIT", PostgresParameters()});
+	// a failed statement leaves the transaction open, for the rollback to end it
+	transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
+	auto results = GetConnectionRaw().ExecutePipeline(context, statements);
+	transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
+	results.pop_back();
+	if (begins) {
+		results.erase(results.begin());
+	}
+	return results;
+}
+
 vector<unique_ptr<PostgresResult>> PostgresTransaction::ExecuteQueries(ClientContext &context, const string &queries) {
 	auto &con = GetConnectionRaw();
 	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {

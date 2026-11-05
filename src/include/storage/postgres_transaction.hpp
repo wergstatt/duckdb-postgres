@@ -41,6 +41,10 @@ public:
 	unique_ptr<PostgresResult> Query(const string &query);
 	unique_ptr<PostgresResult> QueryWithoutTransaction(const string &query);
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
+	//! Executes statements and the COMMIT of this transaction in one round trip, and begins the transaction with them
+	//! if it hasn't begun yet
+	vector<PostgresPipelineResult> ExecutePipelineAndCommit(ClientContext &context,
+	                                                        vector<PostgresPipelineStatement> statements);
 	static PostgresTransaction &Get(ClientContext &context, Catalog &catalog);
 	static string GetBeginTransactionQuery(PostgresIsolationLevel isolation_level, AccessMode access_mode);
 

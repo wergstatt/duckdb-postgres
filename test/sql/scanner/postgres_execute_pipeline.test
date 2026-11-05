@@ -79,5 +79,36 @@ FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
 ----
 2
 
+# with commit, the pipeline also commits the transaction that it runs in
+statement ok
+BEGIN
+
+query II
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl WHERE i = $1', 'params': ['1']}], commit := true)
+----
+1	NULL
+
+statement ok
+ROLLBACK
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+1
+
+# a failed statement commits nothing
+statement error
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'DELETE FROM pipeline_tbl', 'params': []},
+  {'query': 'SELECT 1 / 0', 'params': []}
+], commit := true)
+----
+division by zero
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+1
+
 statement ok
 CALL postgres_execute('s1', 'DROP TABLE pipeline_tbl')

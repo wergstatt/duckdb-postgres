@@ -93,8 +93,8 @@ dbconnector::pool::ConnectionPoolConfig PostgresConnectionPool::CreateConfig(Cli
 	}
 	{
 		Value val;
-		if (ctx.TryGetCurrentSetting("pg_pool_health_check_query", val) && !val.IsNull()) {
-			config.health_check_query = StringValue::Get(val);
+		if (ctx.TryGetCurrentSetting("pg_pool_health_check_query", val)) {
+			config.health_check_query = val.IsNull() ? std::string() : StringValue::Get(val);
 		}
 	}
 

@@ -94,6 +94,13 @@ static PostgresQueryMode ResolveQueryMode(ClientContext &context, TableFunctionB
 	return PostgresQueryMode::AUTO;
 }
 
+//! Whether the result is read with COPY, which sends the query itself and never executes a prepared statement. The
+//! catalog resolves the protocol as in PostgresScanFunction::PrepareBind, ResolveQueryMode has already turned
+//! pg_use_text_protocol into PLAIN_QUERY_TEXT.
+static bool ReadsWithCopy(const PostgresCatalog &catalog, PostgresQueryMode query_mode) {
+	return query_mode != PostgresQueryMode::PLAIN_QUERY_BINARY && !catalog.UseTextProtocol(query_mode, false);
+}
+
 static string StripTrailingSemicolon(string sql) {
 	StringUtil::RTrim(sql);
 	while (!sql.empty() && sql.back() == ';') {
@@ -210,10 +217,14 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 		               std::move(sql), use_transaction, pinned_connection_id, PostgresParameters(), nullptr);
 	}
 
+	auto query_mode = ResolveQueryMode(context, input, param_values);
 	auto conn_lock = con.Lock();
 	auto conn = con.GetConn();
 	// prepare execution of the query to figure out the result types and names
-	string stmt_name = PostgresPreparedStatement::GenerateName();
+	// a COPY read describes the unnamed statement, which the next query replaces, so there is nothing to close. Only
+	// within a transaction, where a pooler keeps the same server connection from the prepare to the describe
+	bool unnamed = ReadsWithCopy(catalog, query_mode) && PQtransactionStatus(conn) == PQTRANS_INTRANS;
+	string stmt_name = unnamed ? string() : PostgresPreparedStatement::GenerateName();
 	if (PostgresConnection::DebugPrintQueries()) {
 		Printer::Print("PREPARE " + stmt_name + ": " + sql + "\n");
 	}
@@ -227,6 +238,10 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 		throw BinderException("Failed to describe prepared statement: %s", extended_err);
 	}
 	conn_lock.unlock();
+	if (unnamed) {
+		// the unnamed statement is neither executed nor closed
+		prepared.reset();
+	}
 	int nparams = PQnparams(describe_prepared);
 	if (nparams != param_values.size()) {
 		throw BinderException("Incorrect number of parameters specified, expected: %d, actual: %zu, query: \"%s\"",
@@ -277,7 +292,7 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	result->read_only = false;
 	result->preliminary_queries = std::move(preliminary_queries);
 	result->sql = std::move(sql);
-	result->query_mode = ResolveQueryMode(context, input, param_values);
+	result->query_mode = query_mode;
 	result->params = PostgresParameters(std::move(param_types), std::move(param_values));
 	result->use_transaction = use_transaction;
 	result->prepared_statement = std::move(prepared);

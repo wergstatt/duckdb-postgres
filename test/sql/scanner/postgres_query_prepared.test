@@ -80,7 +80,7 @@ FROM postgres_query('s', 'SELECT count(*) FROM pg_prepared_statements WHERE stat
 ----
 0
 
-# COPY mode does not use the prepared statement, but closes it
+# COPY mode does not use a prepared statement, none is left
 
 query I
 FROM postgres_query('s', 'SELECT coalesce(max(generic_plans + custom_plans), 0) AS executions
@@ -94,7 +94,7 @@ FROM postgres_query('s', 'SELECT count(*) FROM pg_prepared_statements WHERE stat
 ----
 0
 
-# a command is not executed through the prepared statement, the statement is closed
+# a command is not executed through a prepared statement, none is left
 
 statement ok
 CALL postgres_execute('s', 'CREATE TEMPORARY TABLE m_tx_command_{mode} (i INTEGER)')
@@ -272,6 +272,17 @@ FROM postgres_query('s', 'SELECT count(*) FROM pg_prepared_statements WHERE stat
 query I
 FROM postgres_query('s', 'SELECT coalesce(max(generic_plans + custom_plans), 0) AS executions
     FROM pg_prepared_statements WHERE statement LIKE ''%m_auto_tx_no_params%''')
+----
+0
+
+# a COPY never executes the statement, so the unnamed statement is described: no statement is left to close, even
+# when the query is only bound
+
+statement ok
+EXPLAIN FROM postgres_query('s', 'SELECT 1 AS m_auto_tx_explain')
+
+query I
+FROM postgres_query('s', 'SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE ''%m_auto_tx'' || ''_explain%''')
 ----
 0
 

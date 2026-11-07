@@ -208,7 +208,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 
 vector<PostgresPipelineResult> PostgresConnection::ExecutePipeline(ClientContext &context,
                                                                    const vector<PostgresPipelineStatement> &statements,
-                                                                   bool commit) {
+                                                                   bool commit, bool keep_results) {
 	auto now = [] {
 		return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 		    .time_since_epoch()
@@ -243,7 +243,7 @@ vector<PostgresPipelineResult> PostgresConnection::ExecutePipeline(ClientContext
 		// the flush request makes the server send each result as soon as its statement ran, not at the end
 		if (!synced ||
 		    !PQsendQueryParams(conn, statement.query.c_str(), params.Count(), params.Types(), params.Values(),
-		                       params.Lengths(), params.Formats(), 0) ||
+		                       params.Lengths(), params.Formats(), keep_results ? 1 : 0) ||
 		    !PQsendFlushRequest(conn)) {
 			error_message = StringUtil::Format("Failed to send %s: %s", name(sent), string(PQerrorMessage(conn)));
 			break;
@@ -271,9 +271,15 @@ vector<PostgresPipelineResult> PostgresConnection::ExecutePipeline(ClientContext
 				throw std::runtime_error(StringUtil::Format("Failed to execute %s: COPY is not supported", name(i)));
 			}
 			if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
-				auto has_value = PQntuples(result) > 0 && PQnfields(result) > 0 && !PQgetisnull(result, 0, 0);
+				auto has_value =
+				    !keep_results && PQntuples(result) > 0 && PQnfields(result) > 0 && !PQgetisnull(result, 0, 0);
 				results.push_back({std::atoll(PQcmdTuples(result)),
 				                   has_value ? Value(PQgetvalue(result, 0, 0)) : Value(LogicalType::VARCHAR)});
+				if (keep_results && PQnfields(result) > 0) {
+					// the caller takes the result, so it is not cleared here
+					results.back().result = make_uniq<PostgresResult>(result);
+					result = nullptr;
+				}
 				executed = true;
 			} else if (status != PGRES_PIPELINE_ABORTED) {
 				if (error_message.empty()) {

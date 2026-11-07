@@ -132,10 +132,10 @@ unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const st
 
 vector<PostgresPipelineResult>
 PostgresTransaction::ExecutePipelineAndCommit(ClientContext &context,
-                                              const vector<PostgresPipelineStatement> &statements) {
+                                              const vector<PostgresPipelineStatement> &statements, bool keep_results) {
 	auto &con = GetConnection();
 	try {
-		auto results = con.ExecutePipeline(context, statements, true);
+		auto results = con.ExecutePipeline(context, statements, true, keep_results);
 		// what follows in this transaction begins a new one on the server
 		transaction_state = PostgresTransactionState::TRANSACTION_NOT_YET_STARTED;
 		return results;
@@ -147,6 +147,24 @@ PostgresTransaction::ExecutePipelineAndCommit(ClientContext &context,
 		}
 		throw;
 	}
+}
+
+idx_t PostgresTransaction::KeepResult(unique_ptr<PostgresResult> result) {
+	// an id of another transaction or catalog is not known here, so a process-wide counter hands them out
+	static atomic<idx_t> next_result_id {0};
+	auto id = next_result_id.fetch_add(1);
+	lock_guard<mutex> guard(kept_results_lock);
+	kept_results.emplace(id, std::move(result));
+	return id;
+}
+
+shared_ptr<PostgresResult> PostgresTransaction::GetKeptResult(idx_t id) {
+	lock_guard<mutex> guard(kept_results_lock);
+	auto entry = kept_results.find(id);
+	if (entry == kept_results.end()) {
+		throw InvalidInputException("No pipeline result with id %llu: results are kept until the transaction ends", id);
+	}
+	return entry->second;
 }
 
 vector<unique_ptr<PostgresResult>> PostgresTransaction::ExecuteQueries(ClientContext &context, const string &queries) {

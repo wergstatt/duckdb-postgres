@@ -1,0 +1,141 @@
+# name: test/sql/scanner/postgres_pipeline_result.test
+# description: Test keeping the results of a pipeline and scanning them with their own types
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+BEGIN
+
+# the ids come from a counter of the process, they are captured and compared with each other
+statement ok
+SET VARIABLE kept = (SELECT list({'rows': rowcount, 'id': result_id}) FROM postgres_execute_pipeline('s', [
+  {'query': 'SELECT 42 AS a', 'params': []},
+  {'query': 'SELECT ''x'' AS b', 'params': []}
+], keep_results := true))
+
+query II
+SELECT k.rows, k.id - getvariable('kept')[1].id FROM (SELECT unnest(getvariable('kept')) AS k)
+----
+1	0
+1	1
+
+# the kept results are scanned without a round trip
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+query II
+SELECT a, typeof(a) FROM postgres_pipeline_result('s', getvariable('kept')[1].id)
+----
+42	INTEGER
+
+query II
+SELECT b, typeof(b) FROM postgres_pipeline_result('s', getvariable('kept')[2].id)
+----
+x	VARCHAR
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog')
+----
+0
+
+# a pipeline that commits keeps its results too, a statement that returns no columns has no result
+statement ok
+SET VARIABLE committed = (SELECT list({'rows': rowcount, 'id': result_id}) FROM postgres_execute_pipeline('s', [
+  {'query': 'SET LOCAL work_mem = ''64MB''', 'params': []},
+  {'query': 'SELECT 43 AS c', 'params': []}
+], commit := true, keep_results := true))
+
+query II
+SELECT k.rows, k.id - getvariable('kept')[2].id FROM (SELECT unnest(getvariable('committed')) AS k)
+----
+0	NULL
+1	1
+
+query I
+FROM postgres_pipeline_result('s', getvariable('committed')[2].id)
+----
+43
+
+statement ok
+COMMIT
+
+# the results are kept until the transaction ends
+statement error
+FROM postgres_pipeline_result('s', getvariable('kept')[1].id)
+----
+No pipeline result with id
+
+# the ids are unique across the transactions of a catalog
+statement ok
+BEGIN
+
+statement ok
+SET VARIABLE first_id = (SELECT result_id FROM postgres_execute_pipeline('s', [
+  {'query': 'SELECT 100 AS d', 'params': []}
+], keep_results := true))
+
+query I
+SELECT d FROM postgres_pipeline_result('s', getvariable('first_id'))
+----
+100
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement ok
+SET VARIABLE second_id = (SELECT result_id FROM postgres_execute_pipeline('s', [
+  {'query': 'SELECT 200 AS e', 'params': []}
+], keep_results := true))
+
+query I
+SELECT e FROM postgres_pipeline_result('s', getvariable('second_id'))
+----
+200
+
+# an id of an earlier transaction does not read a result of this one, the error aborts the transaction
+statement error
+FROM postgres_pipeline_result('s', getvariable('first_id'))
+----
+No pipeline result with id
+
+statement ok
+ROLLBACK
+
+# the ids are unique across the catalogs too
+statement ok
+ATTACH 'dbname=postgresscanner' AS s2 (TYPE POSTGRES)
+
+statement ok
+BEGIN
+
+statement ok
+SET VARIABLE s_id = (SELECT result_id FROM postgres_execute_pipeline('s', [
+  {'query': 'SELECT 300 AS f', 'params': []}
+], keep_results := true))
+
+statement ok
+SET VARIABLE s2_id = (SELECT result_id FROM postgres_execute_pipeline('s2', [
+  {'query': 'SELECT 400 AS g', 'params': []}
+], keep_results := true))
+
+query I
+SELECT g FROM postgres_pipeline_result('s2', getvariable('s2_id'))
+----
+400
+
+statement error
+FROM postgres_pipeline_result('s2', getvariable('s_id'))
+----
+No pipeline result with id
+
+statement ok
+ROLLBACK

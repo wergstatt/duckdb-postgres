@@ -228,3 +228,17 @@ DROP TABLE s.rp_cte_upd
 
 statement ok
 DROP TABLE s.rp_cte_shadow
+
+# a CTE reference is not looked up as a table in Postgres
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+query I
+WITH rp_cte_lookup AS (SELECT i FROM s.rp_cte) SELECT COUNT(*) FROM rp_cte_lookup
+----
+10
+
+query I
+SELECT COUNT(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE '%relname=''rp_cte_lookup''%'
+----
+0

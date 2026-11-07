@@ -1,6 +1,7 @@
 #include "postgres_parameters.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/blob.hpp"
 
 #include <libpq-fe.h>
 
@@ -120,6 +121,37 @@ PostgresParameters::PostgresParameters(vector<Oid> types_p, vector<Value> values
 		lengths[i] = param.length;
 		formats[i] = param.format;
 	}
+}
+
+static Value CreateTextValue(const Value &value) {
+	if (value.IsNull()) {
+		return value;
+	}
+	if (value.type().id() != LogicalTypeId::BLOB) {
+		return value.DefaultCastAs(LogicalType::VARCHAR);
+	}
+	// DuckDB keeps the printable bytes of a blob as they are, Postgres reads bytea text that starts with \x as hex
+	string hex = "\\x";
+	for (auto byte : StringValue::Get(value)) {
+		hex += Blob::HEX_TABLE[static_cast<uint8_t>(byte) >> 4];
+		hex += Blob::HEX_TABLE[static_cast<uint8_t>(byte) & 0x0F];
+	}
+	return Value(hex);
+}
+
+PostgresParameters PostgresParameters::Text(vector<Value> values_p) {
+	PostgresParameters result;
+	for (auto &value : values_p) {
+		// 0: no type, the server infers it
+		result.types.push_back(0);
+		result.values.push_back(CreateTextValue(value));
+	}
+	for (auto &value : result.values) {
+		result.value_ptrs.push_back(value.IsNull() ? nullptr : StringValue::Get(value).c_str());
+		result.lengths.push_back(0);
+		result.formats.push_back(FORMAT_TEXT);
+	}
+	return result;
 }
 
 } // namespace duckdb

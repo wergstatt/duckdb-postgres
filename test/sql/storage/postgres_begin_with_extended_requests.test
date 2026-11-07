@@ -1,0 +1,44 @@
+# name: test/sql/storage/postgres_begin_with_extended_requests.test
+# description: BEGIN goes with the first pipeline or query with parameters of a transaction, in the same round trip
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+statement ok
+BEGIN
+
+statement ok
+FROM postgres_execute_pipeline('s', [{'query': 'SELECT CAST($1 AS INTEGER) AS pipelined', 'params': ['1']}])
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement ok
+CALL postgres_execute('s', 'SELECT CAST($1 AS INTEGER) AS with_parameters', params := row(1), prepare := false)
+
+statement ok
+COMMIT
+
+# the log shows the statements that went together
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query = 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ'
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog')
+WHERE query LIKE 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;%pipelined'
+  OR query LIKE 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;%with_parameters'
+----
+2

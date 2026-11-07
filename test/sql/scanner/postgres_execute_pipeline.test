@@ -1,0 +1,84 @@
+# name: test/sql/scanner/postgres_execute_pipeline.test
+# description: Test running several statements with their parameters in one round trip
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s1 (TYPE POSTGRES)
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE IF EXISTS pipeline_tbl')
+
+query I
+SELECT rowcount FROM postgres_execute_pipeline('s1', [
+  {'query': 'CREATE TABLE pipeline_tbl (i INTEGER, s TEXT)', 'params': []},
+  {'query': 'INSERT INTO pipeline_tbl VALUES ($1, $2), ($3, NULL)', 'params': ['1', 'one', '2']},
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2', 'params': ['two', '2']}
+])
+----
+0
+2
+1
+
+query II
+FROM postgres_query('s1', 'SELECT i, s FROM pipeline_tbl ORDER BY i')
+----
+1	one
+2	two
+
+# a statement that returns rows gives the first value of its first row
+query II
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2 RETURNING i', 'params': ['two', '2']},
+  {'query': 'SELECT s FROM pipeline_tbl WHERE i = $1', 'params': ['3']}
+])
+----
+1	2
+0	NULL
+
+# a failed statement names its position and SQLSTATE, skips the statements after it and fails the transaction
+statement error
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'DELETE FROM pipeline_tbl WHERE i = $1', 'params': ['1']},
+  {'query': 'INSERT INTO pipeline_tbl VALUES ($1)', 'params': ['not a number']},
+  {'query': 'DELETE FROM pipeline_tbl', 'params': []}
+])
+----
+<REGEX>:.*statement 2 of the pipeline.*\(SQLSTATE 22P02\).*
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+2
+
+# libpq's pipeline mode does not support COPY, nor does a lost connection hang the pipeline
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'COPY pipeline_tbl TO STDOUT', 'params': []}])
+----
+COPY is not supported
+
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'SELECT pg_terminate_backend(pg_backend_pid())', 'params': []}])
+----
+(SQLSTATE 57P01)
+
+# the statements run in the transaction of the caller
+statement ok
+BEGIN
+
+statement ok
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl', 'params': []}])
+
+statement ok
+ROLLBACK
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+2
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE pipeline_tbl')

@@ -1,0 +1,52 @@
+# name: test/sql/storage/attach_sqlstate.test
+# description: Errors of Postgres name their SQLSTATE, which does not depend on the language of the server
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s1 (TYPE POSTGRES)
+
+statement ok
+DROP TABLE IF EXISTS s1.sqlstate_tbl
+
+statement ok
+CREATE TABLE s1.sqlstate_tbl (i INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO s1.sqlstate_tbl VALUES (1)
+
+# a query
+statement error
+CALL postgres_execute('s1', 'INSERT INTO sqlstate_tbl VALUES (1)')
+----
+(SQLSTATE 23505)
+
+# the COPY of an insert
+statement error
+INSERT INTO s1.sqlstate_tbl VALUES (1)
+----
+(SQLSTATE 23505)
+
+# the COPY of a read
+statement error
+FROM postgres_query('s1', 'SELECT 1 / (i - 2) FROM generate_series(1, 3) i')
+----
+(SQLSTATE 22012)
+
+# the prepare of a read
+statement error
+FROM postgres_query('s1', 'SELECT * FROM sqlstate_missing_tbl')
+----
+(SQLSTATE 42P01)
+
+# a prepared statement
+statement error
+FROM postgres_query('s1', 'SELECT 1 / $1::INTEGER', params=row(0))
+----
+(SQLSTATE 22012)
+
+statement ok
+DROP TABLE s1.sqlstate_tbl

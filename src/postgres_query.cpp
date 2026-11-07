@@ -203,11 +203,9 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	PostgresConnection &con = *con_ptr;
 
 	if (!ExtractFlag(input, "prepare", true)) {
-		if (param_values.size() > 0) {
-			throw BinderException("query parameters cannot be used with 'prepare=FALSE'");
-		}
 		return BindDML(context, input, return_types, names, catalog, con, std::move(preliminary_queries),
-		               std::move(sql), use_transaction, pinned_connection_id, PostgresParameters(), nullptr);
+		               std::move(sql), use_transaction, pinned_connection_id,
+		               PostgresParameters::Text(std::move(param_values)), nullptr);
 	}
 
 	auto conn_lock = con.Lock();
@@ -225,7 +223,7 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	auto describe_prepared = PQdescribePrepared(conn, prepared->GetName().c_str());
 	PostgresResult describe_wrapper(describe_prepared);
 	if (!describe_prepared || PQresultStatus(describe_prepared) != PGRES_COMMAND_OK) {
-		auto extended_err = describe_prepared ? PQresultErrorMessage(describe_prepared) : PQerrorMessage(conn);
+		auto extended_err = PostgresUtils::ErrorMessage(conn, describe_prepared);
 		throw BinderException("Failed to describe prepared statement: %s", extended_err);
 	}
 	conn_lock.unlock();

@@ -61,6 +61,37 @@ static bool ResultHasError(PGresult *result) {
 	}
 }
 
+//! Runs the statements and then the query with its parameters in one pipeline, in one round trip. Returns the result
+//! of the first statement that failed, or else that of the query
+static PGresult *ExecuteAfter(PGconn *conn, const vector<string> &statements, const string &query,
+                              const PostgresParameters &params, int format) {
+	if (!PQenterPipelineMode(conn)) {
+		return nullptr;
+	}
+	auto sent = std::all_of(statements.begin(), statements.end(), [&](const string &statement) {
+		return PQsendQueryParams(conn, statement.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 0);
+	});
+	sent = sent && PQsendQueryParams(conn, query.c_str(), params.Count(), params.Types(), params.Values(),
+	                                 params.Lengths(), params.Formats(), format);
+	sent = PQpipelineSync(conn) && sent;
+	PGresult *result = nullptr;
+	for (idx_t command = 0; sent && command <= statements.size(); command++) {
+		// the results of each command end with a NULL
+		while (auto command_result = PQgetResult(conn)) {
+			auto status = PQresultStatus(command_result);
+			if (!result && (status == PGRES_FATAL_ERROR || command == statements.size())) {
+				result = command_result;
+			} else {
+				PQclear(command_result);
+			}
+		}
+	}
+	// the result of the sync, which ends the pipeline
+	PQclear(PQgetResult(conn));
+	PQexitPipelineMode(conn);
+	return result;
+}
+
 PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, const string &query,
                                         const PostgresParameters &params, int format) {
 	if (PostgresConnection::DebugPrintQueries()) {
@@ -72,20 +103,27 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 
 	PGconn *conn = GetConn();
 	PGresult *res = nullptr;
+	// the log shows the deferred statements that go with the query
+	auto sent_query = query;
 
 	if (params.Empty() && format == 0) {
 		res = PQexec(GetConn(), query.c_str());
-	} else {
+	} else if (deferred.empty()) {
 		// Unlike PQexec, PQexecParams allows at most one SQL command in the given string.
 		res = PQexecParams(conn, query.c_str(), params.Count(), params.Types(), params.Values(), params.Lengths(),
 		                   params.Formats(), format);
+	} else {
+		// so the deferred statements, such as BEGIN, go ahead of the query in a pipeline, in the same round trip
+		auto statements = TakeDeferred();
+		sent_query = StringUtil::Join(statements, ";\n") + ";\n" + query;
+		res = ExecuteAfter(conn, statements, query, params, format);
 	}
 
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
 	                       .count();
 	if (context) {
-		DUCKDB_LOG(*context, PostgresQueryLogType, query, end_time - start_time);
+		DUCKDB_LOG(*context, PostgresQueryLogType, sent_query, end_time - start_time);
 	}
 	return res;
 }
@@ -98,15 +136,13 @@ unique_ptr<PostgresResult> PostgresConnection::TryQuery(optional_ptr<ClientConte
 	if (params.Empty() && format == 0) {
 		// a plain query can hold several statements, so the deferred ones go with it and the error names them too
 		sent_query = PrependDeferred(query);
-	} else {
-		ExecuteDeferred(context);
 	}
 	auto result = PQExecute(context, sent_query, params, format);
 
 	if (ResultHasError(result)) {
 		if (error_message) {
-			auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
-			*error_message = StringUtil::Format("Failed to execute query \"" + sent_query + "\": " + string(error));
+			auto error = PostgresUtils::ErrorMessage(GetConn(), result);
+			*error_message = StringUtil::Format("Failed to execute query \"" + sent_query + "\": " + error);
 		}
 		PQclear(result);
 		return nullptr;
@@ -149,9 +185,9 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 	}
 
 	if (ResultHasError(result)) {
-		auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(conn);
+		auto error = PostgresUtils::ErrorMessage(conn, result);
 		auto error_message = StringUtil::Format("Failed to execute prepared statement \"%s\" for query \"%s\": %s",
-		                                        stmt.GetName(), query, string(error));
+		                                        stmt.GetName(), query, error);
 		PQclear(result);
 		throw std::runtime_error(error_message);
 	}
@@ -188,7 +224,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 		if (ResultHasError(res)) {
 			if (error_message.empty()) {
 				error_message =
-				    "Failed to execute query \"" + sent_queries + "\": " + string(PQresultErrorMessage(res));
+				    "Failed to execute query \"" + sent_queries + "\": " + PostgresUtils::ErrorMessage(GetConn(), res);
 			}
 			continue;
 		}
@@ -204,6 +240,108 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                       .time_since_epoch()
 	                       .count();
 	DUCKDB_LOG(context, PostgresQueryLogType, sent_queries, end_time - start_time);
+	return results;
+}
+
+vector<PostgresPipelineResult>
+PostgresConnection::ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements) {
+	auto now = [] {
+		return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
+		    .time_since_epoch()
+		    .count();
+	};
+	auto name = [](idx_t i) {
+		return StringUtil::Format("statement %d of the pipeline", i + 1);
+	};
+	lock_guard<mutex> guard(connection_lock);
+	auto conn = GetConn();
+	if (!PQenterPipelineMode(conn)) {
+		throw std::runtime_error("Failed to enter pipeline mode: " + string(PQerrorMessage(conn)));
+	}
+	auto previous = now();
+	string error_message;
+	// the deferred statements, such as BEGIN, go ahead of the statements in the same round trip
+	auto ahead = TakeDeferred();
+	for (auto &statement : ahead) {
+		if (error_message.empty() &&
+		    !PQsendQueryParams(conn, statement.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 0)) {
+			error_message =
+			    StringUtil::Format("Failed to send query \"%s\": %s", statement, string(PQerrorMessage(conn)));
+		}
+	}
+	idx_t sent = 0;
+	for (; error_message.empty() && sent < statements.size(); sent++) {
+		auto &statement = statements[sent];
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print(statement.query + "\n");
+		}
+		auto &params = statement.params;
+		// the flush request makes the server send each result as soon as its statement ran, not at the end
+		if (!PQsendQueryParams(conn, statement.query.c_str(), params.Count(), params.Types(), params.Values(),
+		                       params.Lengths(), params.Formats(), 0) ||
+		    !PQsendFlushRequest(conn)) {
+			error_message = StringUtil::Format("Failed to send %s \"%s\": %s", name(sent), statement.query,
+			                                   string(PQerrorMessage(conn)));
+			break;
+		}
+	}
+	if (!PQpipelineSync(conn) && error_message.empty()) {
+		error_message = "Failed to send pipeline: " + string(PQerrorMessage(conn));
+	}
+	for (auto &statement : ahead) {
+		while (auto result = PQgetResult(conn)) {
+			if (error_message.empty() && ResultHasError(result) && PQresultStatus(result) != PGRES_PIPELINE_ABORTED) {
+				error_message = StringUtil::Format("Failed to execute query \"%s\": %s", statement,
+				                                   PostgresUtils::ErrorMessage(conn, result));
+			}
+			PQclear(result);
+		}
+	}
+	// the log shows the deferred statements with the first statement, as it does for a plain query that carries them
+	auto logged_ahead = ahead.empty() ? string() : StringUtil::Join(ahead, ";\n") + ";\n";
+	vector<PostgresPipelineResult> results;
+	for (idx_t i = 0; i < sent; i++) {
+		auto &statement = statements[i];
+		bool executed = false;
+		// the results of each statement end with a NULL
+		while (auto result = PQgetResult(conn)) {
+			auto status = PQresultStatus(result);
+			if (status == PGRES_COPY_IN || status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH) {
+				PQclear(result);
+				// pipeline mode does not support COPY: the connection stays in it, so the pool discards it
+				throw std::runtime_error(
+				    StringUtil::Format("Failed to execute %s \"%s\": COPY is not supported", name(i), statement.query));
+			}
+			if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
+				auto has_value = PQntuples(result) > 0 && PQnfields(result) > 0 && !PQgetisnull(result, 0, 0);
+				results.push_back({std::atoll(PQcmdTuples(result)),
+				                   has_value ? Value(PQgetvalue(result, 0, 0)) : Value(LogicalType::VARCHAR)});
+				executed = true;
+			} else if (status != PGRES_PIPELINE_ABORTED) {
+				if (error_message.empty()) {
+					error_message = StringUtil::Format("Failed to execute %s \"%s\": %s", name(i), statement.query,
+					                                   PostgresUtils::ErrorMessage(conn, result));
+				}
+				executed = true;
+			}
+			PQclear(result);
+		}
+		auto finished = now();
+		if (executed) {
+			// the time since the previous result, so roughly what the server spent on the statement
+			DUCKDB_LOG(context, PostgresQueryLogType, (i == 0 ? logged_ahead : string()) + statement.query,
+			           finished - previous);
+		}
+		previous = finished;
+	}
+	// the result of the sync, which ends the pipeline
+	PQclear(PQgetResult(conn));
+	if (!PQexitPipelineMode(conn) && error_message.empty()) {
+		error_message = "Failed to leave pipeline mode: " + string(PQerrorMessage(conn));
+	}
+	if (!error_message.empty()) {
+		throw std::runtime_error(error_message);
+	}
 	return results;
 }
 
@@ -263,6 +401,13 @@ string PostgresConnection::PrependDeferred(const string &query) {
 	deferred.push_back(query);
 	auto result = StringUtil::Join(deferred, ";\n");
 	deferred.clear();
+	begin_deferred = false;
+	return result;
+}
+
+vector<string> PostgresConnection::TakeDeferred() {
+	vector<string> result;
+	std::swap(result, deferred);
 	begin_deferred = false;
 	return result;
 }

@@ -120,6 +120,10 @@ public:
 
 	static void DeduplicateColumns(vector<Identifier> &names);
 
+	//! The error of a request that failed: the error of its result with the SQLSTATE, by which callers can tell errors
+	//! apart in any server language, or the error of the connection if no result arrived
+	static string ErrorMessage(PGconn *conn, PGresult *result);
+
 private:
 	static mutex libpq_init_lock;
 	static bool libpq_connect_succeeded_at_least_once;

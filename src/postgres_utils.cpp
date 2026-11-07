@@ -872,4 +872,17 @@ void PostgresUtils::DeduplicateColumns(vector<Identifier> &names) {
 	}
 }
 
+string PostgresUtils::ErrorMessage(PGconn *conn, PGresult *result) {
+	if (!result) {
+		return PQerrorMessage(conn);
+	}
+	string message = PQresultErrorMessage(result);
+	auto sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+	if (!sqlstate) {
+		return message;
+	}
+	StringUtil::RTrim(message);
+	return message + " (SQLSTATE " + sqlstate + ")";
+}
+
 } // namespace duckdb

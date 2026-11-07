@@ -58,6 +58,7 @@ private:
 	PostgresTransactionState transaction_state;
 	AccessMode access_mode;
 	PostgresIsolationLevel isolation_level;
+	bool commit_reads_without_waiting;
 	string temporary_schema;
 	mutex referenced_entries_lock;
 	reference_map_t<CatalogEntry, shared_ptr<CatalogEntry>> referenced_entries;

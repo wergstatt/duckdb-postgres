@@ -211,6 +211,8 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	}
 
 	auto conn_lock = con.Lock();
+	// a prepare cannot carry the deferred statements, such as the BEGIN of the transaction
+	con.ExecuteDeferred(context);
 	auto conn = con.GetConn();
 	// prepare execution of the query to figure out the result types and names
 	string stmt_name = PostgresPreparedStatement::GenerateName();

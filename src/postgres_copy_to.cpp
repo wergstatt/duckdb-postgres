@@ -63,11 +63,12 @@ void PostgresConnection::BeginCopyTo(ClientContext &context, PostgresCopyState &
 
 	{
 		lock_guard<mutex> guard(connection_lock);
-		PostgresResult pg_res(PQExecute(context, query.c_str()));
+		auto sent_query = PrependDeferred(query);
+		PostgresResult pg_res(PQExecute(context, sent_query));
 		auto result = pg_res.res;
 		if (!result || PQresultStatus(result) != PGRES_COPY_IN) {
 			auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
-			throw std::runtime_error("Failed to prepare COPY \"" + query + "\": " + string(error));
+			throw std::runtime_error("Failed to prepare COPY \"" + sent_query + "\": " + string(error));
 		}
 	}
 	if (state.format == PostgresCopyFormat::BINARY) {

@@ -1,0 +1,90 @@
+# name: test/sql/storage/attach_commit_reads_without_waiting.test
+# description: With COMMIT_READS_WITHOUT_WAITING, a transaction that only read sends COMMIT without waiting for the reply, a writing or SERIALIZABLE one waits for it
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+# without a health check, the next transaction on the connection reads the reply
+statement ok
+SET pg_pool_health_check_query = ''
+
+statement ok
+ATTACH 'dbname=postgresscanner application_name=commit_reads' AS s (TYPE POSTGRES, COMMIT_READS_WITHOUT_WAITING)
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS observer (TYPE POSTGRES)
+
+statement ok
+CALL postgres_execute('observer', 'DROP TABLE IF EXISTS commit_reads')
+
+statement ok
+CALL postgres_execute('observer', 'CREATE TABLE commit_reads (i INTEGER UNIQUE DEFERRABLE INITIALLY DEFERRED)')
+
+query I
+FROM s.commit_reads
+----
+
+# the read ended its transaction without a further request: another session takes the lock the read held
+statement ok
+CALL postgres_execute('observer', 'SET LOCAL lock_timeout = ''10s''; LOCK TABLE commit_reads IN ACCESS EXCLUSIVE MODE', prepare=FALSE)
+
+query II
+FROM postgres_query('observer', 'SELECT state, query FROM pg_stat_activity WHERE application_name = ''commit_reads''')
+----
+idle	COMMIT
+
+# the catalog load sends several statements at once, after reading the reply
+statement ok
+CALL postgres_clear_cache()
+
+query I
+FROM s.commit_reads
+----
+
+# a write waits for its COMMIT, which fails on the deferred constraint
+statement error
+CALL postgres_execute('s', 'INSERT INTO commit_reads VALUES (1), (1)')
+----
+duplicate key value
+
+# the connection is lost before the COMMIT: the next request reconnects
+statement ok con1
+BEGIN
+
+query I con1
+FROM s.commit_reads
+----
+
+statement ok
+FROM postgres_query('observer', 'SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE application_name = ''commit_reads'' AND state = ''idle in transaction''')
+
+statement ok con1
+COMMIT
+
+query I con1
+FROM s.commit_reads
+----
+
+# at SERIALIZABLE the COMMIT is waited for, so it reports the lost connection
+statement ok
+ATTACH 'dbname=postgresscanner application_name=commit_serializable' AS serializable (TYPE POSTGRES, COMMIT_READS_WITHOUT_WAITING, ISOLATION_LEVEL 'serializable')
+
+statement ok con1
+BEGIN
+
+query I con1
+FROM serializable.commit_reads
+----
+
+statement ok
+FROM postgres_query('observer', 'SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE application_name = ''commit_serializable'' AND state = ''idle in transaction''')
+
+statement error con1
+COMMIT
+----
+Failed to execute query "COMMIT"
+
+statement ok
+CALL postgres_execute('observer', 'DROP TABLE commit_reads')

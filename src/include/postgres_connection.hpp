@@ -68,6 +68,18 @@ public:
 
 	bool IsOpen();
 	void Close();
+	//! Sends a statement with the next request on this connection, instead of in a round trip of its own
+	void Defer(string statement);
+	//! Sends BEGIN with the next request, so that a transaction that sends nothing does not reach the server
+	void DeferBegin(string begin);
+	//! Drops a deferred BEGIN that no other statement follows, returns whether it did
+	bool CancelBegin();
+	//! Commits the transaction. With reads_without_waiting, a transaction that only read sends COMMIT without waiting
+	//! for the reply: the server commits at once, and the next request on the connection reads the reply
+	void Commit(optional_ptr<ClientContext> context, bool reads_without_waiting);
+	//! Sends the deferred statements in a round trip of their own, ahead of a request that cannot carry them. The
+	//! connection lock must be held
+	void ExecuteDeferred(optional_ptr<ClientContext> context);
 	bool PingServer(const std::string &health_check_query);
 	void Reset(const std::string &health_check_query);
 	//! Notes that a named statement was prepared on this connection, or closed again
@@ -98,16 +110,30 @@ private:
 	                    const PostgresParameters &params = PostgresParameters(), int format = 0);
 	//! Requires connection_lock to be held
 	bool PingServerInternal(const std::string &health_check_query);
+	//! Returns the query with the deferred statements ahead of it, to send them in the same plain query. Requires
+	//! connection_lock to be held
+	string PrependDeferred(const string &query);
 	//! Notes the statements sent on this connection, so that a reset can tell whether they changed the session
 	void NoteStatements(const string &sql);
+	//! Reads the reply to a COMMIT sent without waiting, if any, and reconnects if it shows the connection lost.
+	//! Requires connection_lock to be held
+	void ReadPendingCommit();
 
 	PGconn *connection = nullptr;
 	mutex connection_lock;
+	//! The statements to send with the next request
+	vector<string> deferred;
+	//! Whether the BEGIN of a transaction is among the deferred statements
+	bool begin_deferred = false;
 	string dsn;
 	//! Whether a statement may have changed the session beyond its transaction, such as a SET or a temporary table
 	bool session_changed = false;
 	//! The named statements prepared on this connection and not closed yet
 	idx_t open_statements = 0;
+	//! Whether the statements sent since the last BEGIN only read
+	bool only_reads = true;
+	//! Whether the reply to a COMMIT sent without waiting is still to be read
+	bool commit_pending = false;
 };
 
 } // namespace duckdb

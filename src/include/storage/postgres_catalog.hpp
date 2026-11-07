@@ -45,6 +45,8 @@ public:
 	AccessMode access_mode;
 	PostgresIsolationLevel isolation_level;
 	PostgresTextProtocolMode text_protocol_mode;
+	//! Whether a transaction that only read sends its COMMIT without waiting for the reply
+	bool commit_reads_without_waiting = false;
 
 public:
 	void Initialize(bool load_builtin) override;

@@ -30,6 +30,8 @@ PostgresConnection::PostgresConnection(PostgresConnection &&other) noexcept {
 	std::swap(connection, other.connection);
 	std::swap(session_changed, other.session_changed);
 	std::swap(open_statements, other.open_statements);
+	std::swap(only_reads, other.only_reads);
+	std::swap(commit_pending, other.commit_pending);
 	std::swap(dsn, other.dsn);
 }
 
@@ -43,6 +45,8 @@ PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) no
 	std::swap(connection, other.connection);
 	std::swap(session_changed, other.session_changed);
 	std::swap(open_statements, other.open_statements);
+	std::swap(only_reads, other.only_reads);
+	std::swap(commit_pending, other.commit_pending);
 	std::swap(dsn, other.dsn);
 	return *this;
 }
@@ -78,6 +82,7 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 
 	PGconn *conn = GetConn();
 	PGresult *res = nullptr;
+	ReadPendingCommit();
 	NoteStatements(query);
 
 	if (params.Empty() && format == 0) {
@@ -101,12 +106,19 @@ unique_ptr<PostgresResult> PostgresConnection::TryQuery(optional_ptr<ClientConte
                                                         optional_ptr<string> error_message,
                                                         const PostgresParameters &params, int format) {
 	lock_guard<mutex> guard(connection_lock);
-	auto result = PQExecute(context, query.c_str(), params, format);
+	auto sent_query = query;
+	if (params.Empty() && format == 0) {
+		// a plain query can hold several statements, so the deferred ones go with it and the error names them too
+		sent_query = PrependDeferred(query);
+	} else {
+		ExecuteDeferred(context);
+	}
+	auto result = PQExecute(context, sent_query, params, format);
 
 	if (ResultHasError(result)) {
 		if (error_message) {
 			auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
-			*error_message = StringUtil::Format("Failed to execute query \"" + query + "\": " + string(error));
+			*error_message = StringUtil::Format("Failed to execute query \"" + sent_query + "\": " + string(error));
 		}
 		PQclear(result);
 		return nullptr;
@@ -136,6 +148,7 @@ unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientCont
 	                         .count();
 
 	lock_guard<mutex> guard(connection_lock);
+	ExecuteDeferred(context);
 	PGconn *conn = GetConn();
 	NoteStatements(query);
 	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
@@ -171,10 +184,13 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	                         .time_since_epoch()
 	                         .count();
 	lock_guard<mutex> guard(connection_lock);
-	NoteStatements(queries);
-	auto res = PQsendQuery(GetConn(), queries.c_str());
+	auto sent_queries = PrependDeferred(queries);
+	NoteStatements(sent_queries);
+	ReadPendingCommit();
+	auto res = PQsendQuery(GetConn(), sent_queries.c_str());
 	if (res == 0) {
-		throw std::runtime_error("Failed to execute query \"" + queries + "\": " + string(PQerrorMessage(GetConn())));
+		throw std::runtime_error("Failed to execute query \"" + sent_queries +
+		                         "\": " + string(PQerrorMessage(GetConn())));
 	}
 	vector<unique_ptr<PostgresResult>> results;
 	string error_message;
@@ -186,7 +202,8 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 		auto result = make_uniq<PostgresResult>(res);
 		if (ResultHasError(res)) {
 			if (error_message.empty()) {
-				error_message = "Failed to execute query \"" + queries + "\": " + string(PQresultErrorMessage(res));
+				error_message =
+				    "Failed to execute query \"" + sent_queries + "\": " + string(PQresultErrorMessage(res));
 			}
 			continue;
 		}
@@ -201,7 +218,7 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
 	                       .count();
-	DUCKDB_LOG(context, PostgresQueryLogType, queries, end_time - start_time);
+	DUCKDB_LOG(context, PostgresQueryLogType, sent_queries, end_time - start_time);
 	return results;
 }
 
@@ -236,6 +253,87 @@ void PostgresConnection::Close() {
 	connection = nullptr;
 }
 
+void PostgresConnection::Defer(string statement) {
+	lock_guard<mutex> guard(connection_lock);
+	deferred.push_back(std::move(statement));
+}
+
+void PostgresConnection::DeferBegin(string begin) {
+	lock_guard<mutex> guard(connection_lock);
+	deferred.push_back(std::move(begin));
+	begin_deferred = true;
+	only_reads = true;
+}
+
+bool PostgresConnection::CancelBegin() {
+	lock_guard<mutex> guard(connection_lock);
+	if (!begin_deferred || deferred.size() > 1) {
+		return false;
+	}
+	deferred.clear();
+	begin_deferred = false;
+	return true;
+}
+
+string PostgresConnection::PrependDeferred(const string &query) {
+	deferred.push_back(query);
+	auto result = StringUtil::Join(deferred, ";\n");
+	deferred.clear();
+	begin_deferred = false;
+	return result;
+}
+
+void PostgresConnection::Commit(optional_ptr<ClientContext> context, bool reads_without_waiting) {
+	{
+		lock_guard<mutex> guard(connection_lock);
+		if (reads_without_waiting && only_reads && deferred.empty()) {
+			// nothing was written, so whatever the reply says, the transaction is over
+			commit_pending = PQsendQuery(GetConn(), "COMMIT");
+			if (context) {
+				DUCKDB_LOG(*context, PostgresQueryLogType, "COMMIT", 0);
+			}
+			return;
+		}
+	}
+	Execute(context, "COMMIT");
+}
+
+void PostgresConnection::ReadPendingCommit() {
+	if (!commit_pending) {
+		return;
+	}
+	commit_pending = false;
+	auto conn = GetConn();
+	while (auto result = PQgetResult(conn)) {
+		// a failed COMMIT of reads ended the transaction all the same
+		if (ResultHasError(result) && DebugPrintQueries()) {
+			Printer::Print("COMMIT sent without waiting failed: " + string(PQresultErrorMessage(result)));
+		}
+		PQclear(result);
+	}
+	// a lost connection is replaced before the next request, as the pool replaces one that fails its health check
+	PQconsumeInput(conn);
+	if (PQstatus(conn) == CONNECTION_BAD) {
+		PQreset(conn);
+	}
+}
+
+void PostgresConnection::ExecuteDeferred(optional_ptr<ClientContext> context) {
+	// raw requests such as a prepare follow, so the reply to a COMMIT is read here too
+	ReadPendingCommit();
+	if (deferred.empty()) {
+		return;
+	}
+	auto statements = StringUtil::Join(deferred, ";\n");
+	deferred.clear();
+	begin_deferred = false;
+	PostgresResult result(PQExecute(context, statements));
+	if (ResultHasError(result.res)) {
+		auto error = result.res ? PQresultErrorMessage(result.res) : PQerrorMessage(GetConn());
+		throw std::runtime_error("Failed to execute query \"" + statements + "\": " + string(error));
+	}
+}
+
 bool PostgresConnection::PingServer(const std::string &health_check_query) {
 	lock_guard<mutex> guard(connection_lock);
 	return PingServerInternal(health_check_query);
@@ -252,6 +350,7 @@ bool PostgresConnection::PingServerInternal(const std::string &health_check_quer
 	if (health_check_query.empty()) {
 		return true;
 	}
+	ReadPendingCommit();
 	PGresult *res = PQexec(conn, health_check_query.c_str());
 	PostgresResult res_holder(res);
 	return PQresultStatus(res) == PGRES_TUPLES_OK;
@@ -263,14 +362,18 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 		throw InternalException("Cannot reset a connection that is not open");
 	}
 	PGconn *conn = GetConn();
+	deferred.clear();
+	begin_deferred = false;
 	auto tx_status = PQtransactionStatus(conn);
 	if (tx_status == PQTRANS_INTRANS || tx_status == PQTRANS_INERROR) {
 		PGresult *res = PQexec(conn, "ROLLBACK");
 		PostgresResult res_holder(res);
 	}
-	if (!session_changed && open_statements == 0 && PQtransactionStatus(conn) == PQTRANS_IDLE) {
+	// a COMMIT sent without waiting has ended the transaction, the next request reads its reply
+	if (!session_changed && open_statements == 0 && (commit_pending || PQtransactionStatus(conn) == PQTRANS_IDLE)) {
 		return;
 	}
+	ReadPendingCommit();
 	session_changed = false;
 	open_statements = 0;
 	{
@@ -343,8 +446,30 @@ static bool LeavesSessionUnchanged(const string &sql) {
 	return true;
 }
 
+//! Whether the statements of a query only read, so that a failed COMMIT would lose nothing. As above, literals and
+//! comments can only make a query count as a write. A function that writes is not detected.
+static bool OnlyReads(const string &sql) {
+	static const unordered_set<string> READING = {"BEGIN", "SET", "SHOW", "SELECT", "WITH", "VALUES", "TABLE"};
+	// also SELECT ... INTO, which creates a table, SELECT ... FOR UPDATE, which locks rows, and SERIALIZABLE in a BEGIN
+	// or SET TRANSACTION: such a COMMIT can fail to serialize, and then the reads must not be used
+	static const unordered_set<string> WRITING = {"INSERT", "UPDATE", "DELETE", "MERGE", "INTO", "SERIALIZABLE"};
+	auto statements = StringUtil::Split(sql, ';');
+	return std::all_of(statements.begin(), statements.end(), [](const string &statement) {
+		auto words = Words(statement);
+		if (words.empty()) {
+			return true;
+		}
+		// a COPY reads when it copies to the client, as scans do
+		auto reads =
+		    words[0] == "COPY" ? std::count(words.begin(), words.end(), "STDOUT") > 0 : READING.count(words[0]) > 0;
+		return reads &&
+		       std::none_of(words.begin(), words.end(), [](const string &word) { return WRITING.count(word) > 0; });
+	});
+}
+
 void PostgresConnection::NoteStatements(const string &sql) {
 	session_changed = session_changed || !LeavesSessionUnchanged(sql);
+	only_reads = only_reads && OnlyReads(sql);
 }
 
 void PostgresConnection::NoteStatementPrepared() {

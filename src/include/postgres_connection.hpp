@@ -36,6 +36,8 @@ struct PostgresPipelineResult {
 	int64_t rows;
 	//! The first value of the first row, as text, for statements that return rows
 	Value value;
+	//! With keep_results, the rows in the binary format instead of the first value, for statements that return columns
+	unique_ptr<PostgresResult> result;
 };
 
 class PostgresConnection {
@@ -66,8 +68,9 @@ public:
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
 	//! Executes statements in one round trip and returns the result of each. A failed statement skips the statements
 	//! after it, and its error names its position and SQLSTATE. With commit, a COMMIT follows them in the round trip
-	vector<PostgresPipelineResult>
-	ExecutePipeline(ClientContext &context, const vector<PostgresPipelineStatement> &statements, bool commit = false);
+	vector<PostgresPipelineResult> ExecutePipeline(ClientContext &context,
+	                                               const vector<PostgresPipelineStatement> &statements,
+	                                               bool commit = false, bool keep_results = false);
 
 	PostgresVersion GetPostgresVersion(ClientContext &context);
 

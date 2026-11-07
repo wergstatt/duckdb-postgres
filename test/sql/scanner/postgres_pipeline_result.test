@@ -1,0 +1,65 @@
+# name: test/sql/scanner/postgres_pipeline_result.test
+# description: Test keeping the results of a pipeline and scanning them with their own types
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+BEGIN
+
+query II
+FROM postgres_execute_pipeline('s', [
+  {'query': 'SELECT 42 AS a', 'params': []},
+  {'query': 'SELECT ''x'' AS b', 'params': []}
+], keep_results := true)
+----
+1	0
+1	1
+
+# the kept results are scanned without a round trip
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+query II
+SELECT a, typeof(a) FROM postgres_pipeline_result('s', 0)
+----
+42	INTEGER
+
+query II
+SELECT b, typeof(b) FROM postgres_pipeline_result('s', 1)
+----
+x	VARCHAR
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog')
+----
+0
+
+# a pipeline that commits keeps its results too, a statement that returns no columns has no result
+query II
+FROM postgres_execute_pipeline('s', [
+  {'query': 'SET LOCAL work_mem = ''64MB''', 'params': []},
+  {'query': 'SELECT 43 AS c', 'params': []}
+], commit := true, keep_results := true)
+----
+0	NULL
+1	2
+
+query I
+FROM postgres_pipeline_result('s', 2)
+----
+43
+
+statement ok
+COMMIT
+
+# the results are kept until the transaction ends
+statement error
+FROM postgres_pipeline_result('s', 0)
+----
+No pipeline result with id 0

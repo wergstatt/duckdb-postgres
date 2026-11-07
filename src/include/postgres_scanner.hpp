@@ -122,6 +122,11 @@ public:
 	PostgresExecutePipelineFunction();
 };
 
+class PostgresPipelineResultFunction : public TableFunction {
+public:
+	PostgresPipelineResultFunction();
+};
+
 class PostgresPinConnectionFunction : public ScalarFunction {
 public:
 	PostgresPinConnectionFunction();

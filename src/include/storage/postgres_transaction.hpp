@@ -43,7 +43,13 @@ public:
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
 	//! Executes statements and the COMMIT of this transaction in one round trip
 	vector<PostgresPipelineResult> ExecutePipelineAndCommit(ClientContext &context,
-	                                                        const vector<PostgresPipelineStatement> &statements);
+	                                                        const vector<PostgresPipelineStatement> &statements,
+	                                                        bool keep_results = false);
+	//! Keeps a result of a pipeline until this transaction ends, also after a pipeline committed the transaction on
+	//! the server, and returns its id
+	idx_t KeepResult(unique_ptr<PostgresResult> result);
+	//! The result kept with the id
+	shared_ptr<PostgresResult> GetKeptResult(idx_t id);
 	static PostgresTransaction &Get(ClientContext &context, Catalog &catalog);
 	static string GetBeginTransactionQuery(PostgresIsolationLevel isolation_level, AccessMode access_mode);
 
@@ -66,6 +72,8 @@ private:
 	reference_map_t<CatalogEntry, shared_ptr<CatalogEntry>> referenced_entries;
 	mutex pending_signatures_lock;
 	vector<pair<reference<PostgresCatalogSet>, string>> pending_signatures;
+	mutex kept_results_lock;
+	vector<shared_ptr<PostgresResult>> kept_results;
 
 private:
 	//! Retrieves the connection **without** starting a transaction if none is active

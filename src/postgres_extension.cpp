@@ -137,6 +137,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	PostgresExecutePipelineFunction execute_pipeline_func;
 	loader.RegisterFunction(execute_pipeline_func);
 
+	PostgresPipelineResultFunction pipeline_result_func;
+	loader.RegisterFunction(pipeline_result_func);
+
 	PostgresBinaryCopyFunction binary_copy;
 	loader.RegisterFunction(binary_copy);
 

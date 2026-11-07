@@ -473,7 +473,7 @@ void PostgresSQLWriter::CollectNames(TableRef &ref) {
 		auto &function_name = ref.Cast<TableFunctionRef>().function->Cast<FunctionExpression>().FunctionName();
 		table_function_aliases[ref.alias.GetIdentifierName()] = function_name.GetIdentifierName();
 	}
-	if (ref.type == TableReferenceType::BASE_TABLE) {
+	if (ref.type == TableReferenceType::BASE_TABLE && !IsCTEReference(ref.Cast<BaseTableRef>())) {
 		auto table = LookupTable(ref.Cast<BaseTableRef>());
 		if (table) {
 			AddTableNames(*table);
@@ -558,9 +558,12 @@ void PostgresSQLWriter::CollectNames(QueryNode &node) {
 			AddQueryName(alias);
 		}
 	}
+	// references to the CTEs are not looked up in the catalog
+	cte_scopes.push_back(node.cte_map);
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    node, [&](unique_ptr<ParsedExpression> &child) { CollectNames(*child); },
 	    [&](TableRef &ref) { CollectNames(ref); });
+	cte_scopes.pop_back();
 }
 
 string PostgresSQLWriter::WriteIdentifier(const string &identifier) {

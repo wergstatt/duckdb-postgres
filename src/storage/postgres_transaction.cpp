@@ -14,7 +14,8 @@ namespace duckdb {
 PostgresTransaction::PostgresTransaction(PostgresCatalog &postgres_catalog, TransactionManager &manager,
                                          ClientContext &context)
     : Transaction(manager, context), access_mode(postgres_catalog.access_mode),
-      isolation_level(postgres_catalog.isolation_level) {
+      isolation_level(postgres_catalog.isolation_level),
+      commit_reads_without_waiting(postgres_catalog.commit_reads_without_waiting) {
 	auto oauth_token_holder = SetThreadLocalOAuthTokenFromSessionOption(context);
 	connection = postgres_catalog.GetConnectionPool().Acquire();
 }
@@ -31,7 +32,10 @@ void PostgresTransaction::Start() {
 void PostgresTransaction::Commit() {
 	if (transaction_state == PostgresTransactionState::TRANSACTION_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
-		GetConnectionRaw().Execute(GetContext(), "COMMIT");
+		// a transaction that sent nothing has nothing to commit, otherwise COMMIT carries what is still deferred
+		if (!GetConnectionRaw().CancelBegin()) {
+			GetConnectionRaw().Commit(GetContext(), commit_reads_without_waiting);
+		}
 	}
 	vector<pair<reference<PostgresCatalogSet>, string>> to_promote;
 	{
@@ -45,7 +49,9 @@ void PostgresTransaction::Commit() {
 void PostgresTransaction::Rollback() {
 	if (transaction_state == PostgresTransactionState::TRANSACTION_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_FINISHED;
-		GetConnectionRaw().Execute(GetContext(), "ROLLBACK");
+		if (!GetConnectionRaw().CancelBegin()) {
+			GetConnectionRaw().Execute(GetContext(), "ROLLBACK");
+		}
 	}
 	lock_guard<mutex> l(pending_signatures_lock);
 	pending_signatures.clear();
@@ -90,8 +96,8 @@ PostgresConnection &PostgresTransaction::GetConnection() {
 	auto &con = GetConnectionRaw();
 	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string query = GetBeginTransactionQuery();
-		con.Execute(GetContext(), query);
+		// BEGIN goes with the first statement of the transaction
+		con.DeferBegin(GetBeginTransactionQuery());
 	}
 	return con;
 }
@@ -109,14 +115,7 @@ string PostgresTransaction::GetDSN() {
 }
 
 unique_ptr<PostgresResult> PostgresTransaction::Query(const string &query) {
-	auto &con = GetConnectionRaw();
-	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string transaction_start = GetBeginTransactionQuery();
-		transaction_start += ";\n";
-		return con.Query(GetContext(), transaction_start + query);
-	}
-	return con.Query(GetContext(), query);
+	return GetConnection().Query(GetContext(), query);
 }
 
 unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const string &query) {
@@ -130,15 +129,41 @@ unique_ptr<PostgresResult> PostgresTransaction::QueryWithoutTransaction(const st
 	return con.Query(GetContext(), query);
 }
 
-vector<unique_ptr<PostgresResult>> PostgresTransaction::ExecuteQueries(ClientContext &context, const string &queries) {
-	auto &con = GetConnectionRaw();
-	if (transaction_state == PostgresTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = PostgresTransactionState::TRANSACTION_STARTED;
-		string transaction_start = GetBeginTransactionQuery();
-		transaction_start += ";\n";
-		return con.ExecuteQueries(context, transaction_start + queries);
+vector<PostgresPipelineResult>
+PostgresTransaction::ExecutePipelineAndCommit(ClientContext &context,
+                                              const vector<PostgresPipelineStatement> &statements, bool keep_results) {
+	auto &con = GetConnection();
+	try {
+		auto results = con.ExecutePipeline(context, statements, true, keep_results);
+		// what follows in this transaction begins a new one on the server
+		transaction_state = PostgresTransactionState::TRANSACTION_NOT_YET_STARTED;
+		return results;
+	} catch (...) {
+		// the COMMIT rolled back if a statement failed: the transaction is over unless the server still has it open
+		auto status = PQtransactionStatus(con.GetConn());
+		if (status != PQTRANS_INTRANS && status != PQTRANS_INERROR) {
+			transaction_state = PostgresTransactionState::TRANSACTION_NOT_YET_STARTED;
+		}
+		throw;
 	}
-	return con.ExecuteQueries(context, queries);
+}
+
+idx_t PostgresTransaction::KeepResult(unique_ptr<PostgresResult> result) {
+	lock_guard<mutex> guard(kept_results_lock);
+	kept_results.push_back(std::move(result));
+	return kept_results.size() - 1;
+}
+
+shared_ptr<PostgresResult> PostgresTransaction::GetKeptResult(idx_t id) {
+	lock_guard<mutex> guard(kept_results_lock);
+	if (id >= kept_results.size()) {
+		throw InvalidInputException("No pipeline result with id %llu: results are kept until the transaction ends", id);
+	}
+	return kept_results[id];
+}
+
+vector<unique_ptr<PostgresResult>> PostgresTransaction::ExecuteQueries(ClientContext &context, const string &queries) {
+	return GetConnection().ExecuteQueries(context, queries);
 }
 
 optional_ptr<CatalogEntry> PostgresTransaction::ReferenceEntry(shared_ptr<CatalogEntry> &entry) {

@@ -15,8 +15,17 @@ namespace duckdb {
 
 using dbconnector::functions::ConfigurePool;
 
+static uint64_t GetHealthCheckIntervalMillis(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("pg_pool_health_check_interval_millis", val) && !val.IsNull()) {
+		return UBigIntValue::Get(val);
+	}
+	return 0;
+}
+
 PostgresConnectionPool::PostgresConnectionPool(PostgresCatalog &postgres_catalog, ClientContext &context)
-    : dbconnector::pool::ConnectionPool<PostgresConnection>(CreateConfig(context)), postgres_catalog(postgres_catalog) {
+    : dbconnector::pool::ConnectionPool<PostgresConnection>(CreateConfig(context)), postgres_catalog(postgres_catalog),
+      health_check_interval_millis(GetHealthCheckIntervalMillis(context)) {
 }
 
 bool PostgresConnectionPool::TryGetConnection(PostgresPoolConnection &connection) {
@@ -36,6 +45,9 @@ std::unique_ptr<PostgresConnection> PostgresConnectionPool::CreateNewConnection(
 bool PostgresConnectionPool::CheckConnectionHealthy(PostgresConnection &conn) {
 	if (!conn.IsOpen()) {
 		return false;
+	}
+	if (PQstatus(conn.GetConn()) == CONNECTION_OK && conn.AnsweredWithin(health_check_interval_millis)) {
+		return true;
 	}
 	std::string query = GetHealthCheckQuery();
 	return conn.PingServer(query);
@@ -93,8 +105,8 @@ dbconnector::pool::ConnectionPoolConfig PostgresConnectionPool::CreateConfig(Cli
 	}
 	{
 		Value val;
-		if (ctx.TryGetCurrentSetting("pg_pool_health_check_query", val) && !val.IsNull()) {
-			config.health_check_query = StringValue::Get(val);
+		if (ctx.TryGetCurrentSetting("pg_pool_health_check_query", val)) {
+			config.health_check_query = val.IsNull() ? std::string() : StringValue::Get(val);
 		}
 	}
 

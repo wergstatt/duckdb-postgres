@@ -26,7 +26,10 @@ PostgresBinaryReader::~PostgresBinaryReader() {
 
 void PostgresBinaryReader::BeginCopy(ClientContext &context, const string &sql) {
 	if (mode == PostgresBinaryReaderMode::PLAIN_QUERY) {
-		this->result = Query(context, sql, 1);
+		this->result = bind_data.TakeBindResult(sql);
+		if (!this->result) {
+			this->result = Query(context, sql, 1);
+		}
 		this->row_offset = 0;
 	} else {
 		// COPY does not use the statement, it must be closed before the connection enters the COPY state
@@ -79,7 +82,8 @@ bool PostgresBinaryReader::FetchNextBuffer() {
 				break;
 			}
 			if (PQresultStatus(final_result) != PGRES_COMMAND_OK) {
-				throw IOException("Failed to fetch header for COPY: %s", string(PQresultErrorMessage(final_result)));
+				throw IOException("Failed to fetch header for COPY: %s",
+				                  PostgresUtils::ErrorMessage(con.GetConn(), final_result));
 			}
 		}
 		return false;

@@ -167,6 +167,14 @@ PostgresBindData::PostgresBindData(ClientContext &context, const Identifier &cat
 	}
 }
 
+unique_ptr<PostgresResult> PostgresBindData::TakeBindResult(const string &query) const {
+	lock_guard<mutex> guard(bind_result_lock);
+	if (query != sql) {
+		return nullptr;
+	}
+	return std::move(bind_result);
+}
+
 void PostgresBindData::SetTablePages(idx_t approx_num_pages) {
 	this->pages_approx = approx_num_pages;
 	if (!read_only || use_text_protocol) {
@@ -352,19 +360,19 @@ static unique_ptr<LocalTableFunctionState> GetLocalState(ClientContext &context,
 
 static void PostgresScanConnect(ClientContext &context, PostgresConnection &conn, const string &snapshot,
                                 AccessMode access_mode, PostgresIsolationLevel isolation_level) {
-	conn.Execute(context, PostgresTransaction::GetBeginTransactionQuery(isolation_level, access_mode));
+	// the transaction starts with the first query on the connection
+	conn.DeferBegin(PostgresTransaction::GetBeginTransactionQuery(isolation_level, access_mode));
 	if (!snapshot.empty()) {
 		D_ASSERT(isolation_level != PostgresIsolationLevel::READ_COMMITTED);
-		conn.Query(context, StringUtil::Format("SET TRANSACTION SNAPSHOT '%s'", snapshot));
+		conn.Defer(StringUtil::Format("SET TRANSACTION SNAPSHOT '%s'", snapshot));
 	}
 	Value statement_timeout;
 	if (context.TryGetCurrentSetting("pg_statement_timeout_millis", statement_timeout) && !statement_timeout.IsNull()) {
-		conn.Execute(context, StringUtil::Format("SET statement_timeout=%u", UIntegerValue::Get(statement_timeout)));
+		conn.Defer(StringUtil::Format("SET statement_timeout=%u", UIntegerValue::Get(statement_timeout)));
 	}
 	Value idle_timeout;
 	if (context.TryGetCurrentSetting("pg_idle_in_transaction_timeout_millis", idle_timeout) && !idle_timeout.IsNull()) {
-		conn.Execute(context, StringUtil::Format("SET idle_in_transaction_session_timeout=%u",
-		                                         UIntegerValue::Get(idle_timeout)));
+		conn.Defer(StringUtil::Format("SET idle_in_transaction_session_timeout=%u", UIntegerValue::Get(idle_timeout)));
 	}
 }
 
@@ -404,7 +412,13 @@ static unique_ptr<GlobalTableFunctionState> PostgresInitGlobalState(ClientContex
 	}
 
 	for (const string &query : bind_data.preliminary_queries) {
-		con.Execute(context, query);
+		// within the transaction, the preliminary queries go with the query. Outside of one, statements sent together
+		// would run in one implicit transaction, which changes what they do
+		if (bind_data.use_transaction && bind_data.pinned_connection_id == 0) {
+			con.Defer(query);
+		} else {
+			con.Execute(context, query);
+		}
 	}
 
 	if (bind_data.command_only) {

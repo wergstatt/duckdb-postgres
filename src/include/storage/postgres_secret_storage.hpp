@@ -24,7 +24,10 @@ struct SecretStorageTable {
 	bool specified_explicitly;
 
 	SecretStorageTable(string name_p, bool specified_explicitly_p);
-	bool Exists(PostgresConnection &connection);
+	//! The query that tells whether the table exists, 'to_regclass' should require the least priviliges
+	string ExistsQuery();
+	//! Whether the table exists, from the result of ExistsQuery or, if it failed, from another query
+	bool Exists(PostgresConnection &connection, optional_ptr<PostgresResult> exists_result);
 	string Create(PostgresConnection &connection);
 	bool DisabledByUser();
 };

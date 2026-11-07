@@ -1,0 +1,150 @@
+# name: test/sql/scanner/postgres_execute_pipeline.test
+# description: Test running several statements with their parameters in one round trip
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s1 (TYPE POSTGRES)
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE IF EXISTS pipeline_tbl')
+
+query I
+SELECT rowcount FROM postgres_execute_pipeline('s1', [
+  {'query': 'CREATE TABLE pipeline_tbl (i INTEGER, s TEXT)', 'params': []},
+  {'query': 'INSERT INTO pipeline_tbl VALUES ($1, $2), ($3, NULL)', 'params': ['1', 'one', '2']},
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2', 'params': ['two', '2']}
+])
+----
+0
+2
+1
+
+query II
+FROM postgres_query('s1', 'SELECT i, s FROM pipeline_tbl ORDER BY i')
+----
+1	one
+2	two
+
+# a statement that returns rows gives the first value of its first row
+query II
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'UPDATE pipeline_tbl SET s = $1 WHERE i = $2 RETURNING i', 'params': ['two', '2']},
+  {'query': 'SELECT s FROM pipeline_tbl WHERE i = $1', 'params': ['3']}
+])
+----
+1	2
+0	NULL
+
+# a failed statement names its position and SQLSTATE, skips the statements after it and fails the transaction
+statement error
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'DELETE FROM pipeline_tbl WHERE i = $1', 'params': ['1']},
+  {'query': 'INSERT INTO pipeline_tbl VALUES ($1)', 'params': ['not a number']},
+  {'query': 'DELETE FROM pipeline_tbl', 'params': []}
+])
+----
+<REGEX>:.*statement 2 of the pipeline.*\(SQLSTATE 22P02\).*
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+2
+
+# libpq's pipeline mode does not support COPY, nor does a lost connection hang the pipeline
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'COPY pipeline_tbl TO STDOUT', 'params': []}])
+----
+COPY is not supported
+
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'SELECT pg_terminate_backend(pg_backend_pid())', 'params': []}])
+----
+(SQLSTATE 57P01)
+
+# the statements run in the transaction of the caller
+statement ok
+BEGIN
+
+statement ok
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl', 'params': []}])
+
+statement ok
+ROLLBACK
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+2
+
+# with commit, the pipeline also commits the transaction that it runs in, and what follows runs in a new one
+statement ok
+BEGIN
+
+query II
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl WHERE i = $1', 'params': ['1']}], commit := true)
+----
+1	NULL
+
+statement ok
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl', 'params': []}])
+
+statement ok
+ROLLBACK
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+1
+
+# a failed statement commits nothing, and its transaction ends in the same round trip, with no ROLLBACK after it
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+statement error
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'DELETE FROM pipeline_tbl', 'params': []},
+  {'query': 'SELECT 1 / 0', 'params': []}
+], commit := true)
+----
+division by zero
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query = 'ROLLBACK'
+----
+0
+
+# a server error before the COMMIT, even one that ends the connection, means that the COMMIT did not run
+statement error
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'DELETE FROM pipeline_tbl', 'params': []},
+  {'query': 'SELECT pg_terminate_backend(pg_backend_pid())', 'params': []}
+], commit := true)
+----
+<REGEX>:Invalid Error: Failed to execute statement 2 of the pipeline.*\(SQLSTATE 57P01\).*
+
+query I
+FROM postgres_query('s1', 'SELECT count(*) FROM pipeline_tbl')
+----
+1
+
+# a connection lost while the COMMIT runs leaves the outcome unknown
+statement ok
+FROM postgres_execute_pipeline('s1', [
+  {'query': 'CREATE OR REPLACE FUNCTION pipeline_terminate() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); RETURN NULL; END$$', 'params': []},
+  {'query': 'CREATE CONSTRAINT TRIGGER pipeline_terminate AFTER DELETE ON pipeline_tbl DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION pipeline_terminate()', 'params': []}
+])
+
+statement error
+FROM postgres_execute_pipeline('s1', [{'query': 'DELETE FROM pipeline_tbl', 'params': []}], commit := true)
+----
+whether the transaction committed is unknown (SQLSTATE 08007)
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE pipeline_tbl')
+
+statement ok
+CALL postgres_execute('s1', 'DROP FUNCTION pipeline_terminate')

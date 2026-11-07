@@ -155,6 +155,25 @@ FROM postgres_query('s1', 'SELECT i FROM execute_params_tbl')
 ----
 42
 
+# without preparing, the values are sent as text, so a BIGINT also fits the INTEGER column
+query I
+FROM postgres_execute('s1', 'INSERT INTO execute_params_tbl VALUES ($1), ($2)', prepare=FALSE, params=row(43::BIGINT, NULL))
+----
+2
+
+query I
+FROM postgres_query('s1', 'SELECT i FROM execute_params_tbl ORDER BY i NULLS LAST')
+----
+42
+43
+NULL
+
+# a blob goes as bytea text in hex: DuckDB's text of 0xAB 'A' 'B' is \xABAB, which Postgres would read as 0xABAB
+query I
+FROM postgres_execute('s1', 'SELECT 1 WHERE $1 = ''\xab4142''::BYTEA', prepare=FALSE, params=row('\xABAB'::BLOB))
+----
+1
+
 statement error
 CALL postgres_execute('s1', 'INSERT INTO execute_params_tbl VALUES ($1)', params=row(42, 43))
 ----

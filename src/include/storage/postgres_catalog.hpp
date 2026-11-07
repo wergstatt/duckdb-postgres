@@ -45,6 +45,8 @@ public:
 	AccessMode access_mode;
 	PostgresIsolationLevel isolation_level;
 	PostgresTextProtocolMode text_protocol_mode;
+	//! Whether a transaction that only read sends its COMMIT without waiting for the reply
+	bool commit_reads_without_waiting = false;
 
 public:
 	void Initialize(bool load_builtin) override;
@@ -149,7 +151,8 @@ private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 	void RegisterSecretStorage();
-	void InitializeRemotePushdown(ClientContext &context, PostgresConnection &connection);
+	//! Sets up remote pushdown with the result of the collation probe
+	void InitializeRemotePushdown(ClientContext &context, optional_ptr<PostgresResult> result);
 	//! Statements to run before a pushed down query (e.g. aligning the session time zone with DuckDB's)
 	vector<string> GetRemotePushdownPreliminaryQueries(ClientContext &context, bool requires_time_zone);
 
@@ -169,6 +172,8 @@ private:
 	shared_ptr<PostgresConnectionPool> connection_pool;
 	Identifier default_schema;
 	SecretStorageTable secret_storage_table;
+	//! Whether the secret storage table existed at attach time
+	bool secret_storage_table_exists = false;
 	//! Overrides what the shell prompt displays for this catalog - see GetConnectDisplay
 	string connect_display;
 

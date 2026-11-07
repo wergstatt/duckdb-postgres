@@ -195,6 +195,22 @@ SELECT COUNT(*) FROM s.rp_dml
 ----
 5
 
+# the result of DML is the number of changed rows, the statement is not prepared to describe it - so EXPLAIN leaves
+# no prepared statement behind
+statement ok
+BEGIN
+
+statement ok
+EXPLAIN DELETE FROM s.rp_dml WHERE id > 1
+
+query I
+FROM postgres_query('s', 'SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE ''DELETE%''')
+----
+0
+
+statement ok
+ROLLBACK
+
 # DML with a local table is not pushed down
 statement ok
 CREATE TABLE local_dml AS SELECT 1 AS id

@@ -25,10 +25,20 @@ public:
 
 	static string GetInitializeQuery(const vector<string> &schemas);
 	static string GetInitializeQueryInformationSchema(const vector<string> &schemas);
+	//! The condition on a schema name column that selects the schemas to load - all schemas but the system schemas
+	//! if empty, these are loaded when they are used
+	static string GetSchemaCondition(const string &column, const vector<string> &schemas);
+
+	optional_ptr<CatalogEntry> ReloadEntry(PostgresTransaction &transaction, const string &name) override;
 
 protected:
 	void LoadEntries(ClientContext &context, PostgresTransaction &transaction) override;
 	void LoadEntriesInformationSchema(ClientContext &context, PostgresTransaction &transaction);
+	optional_ptr<CatalogEntry> LoadSchemas(ClientContext &context, PostgresTransaction &transaction,
+	                                       const vector<string> &schemas);
+	bool SupportReload() const override {
+		return true;
+	}
 
 protected:
 	//! Schema to load - if empty loads all schemas (default behavior)

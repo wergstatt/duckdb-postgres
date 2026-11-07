@@ -41,6 +41,8 @@ protected:
 
 private:
 	PostgresCatalog &postgres_catalog;
+	//! A connection that the server answered on within this time is not checked
+	uint64_t health_check_interval_millis;
 
 	bool PoolEnabled();
 	static dbconnector::pool::ConnectionPoolConfig CreateConfig(ClientContext &ctx);

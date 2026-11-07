@@ -134,6 +134,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	PostgresExecuteFunction execute_func;
 	loader.RegisterFunction(execute_func);
 
+	PostgresExecutePipelineFunction execute_pipeline_func;
+	loader.RegisterFunction(execute_pipeline_func);
+
+	PostgresPipelineResultFunction pipeline_result_func;
+	loader.RegisterFunction(pipeline_result_func);
+
 	PostgresBinaryCopyFunction binary_copy;
 	loader.RegisterFunction(binary_copy);
 
@@ -294,6 +300,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "an empty string disables the health check. " +
 	                              CreatePoolNote("health_check_query=SELECT 42"),
 	                          LogicalType::VARCHAR, default_pool_config.health_check_query, nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_health_check_interval_millis",
+	                          "A connection that the server answered on within this number of milliseconds is taken "
+	                          "from and returned to the pool without a health check. 0 checks it every time.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(5000), nullptr, SetScope::GLOBAL);
 
 	OptimizerExtension postgres_optimizer;
 	postgres_optimizer.optimize_function = PostgresOptimizer::Optimize;

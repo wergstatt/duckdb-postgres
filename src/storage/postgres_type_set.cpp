@@ -7,6 +7,7 @@
 
 #include "postgres_utils.hpp"
 #include "storage/postgres_schema_entry.hpp"
+#include "storage/postgres_schema_set.hpp"
 #include "storage/postgres_type_entry.hpp"
 #include "storage/postgres_transaction.hpp"
 
@@ -41,10 +42,7 @@ JOIN pg_namespace AS n ON (typnamespace=n.oid)
 ${CONDITION}
 ORDER BY n.oid, enumtypid, enumsortorder;
 )";
-	string condition;
-	if (schemas.size() > 0) {
-		condition += "WHERE n.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
-	}
+	auto condition = "WHERE " + PostgresSchemaSet::GetSchemaCondition("n.nspname", schemas);
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
 
@@ -102,10 +100,7 @@ AND NOT pg_attribute.attisdropped
 ${CONDITION}
 ORDER BY n.oid, t.oid, attrelid, attnum;
 )";
-	string condition;
-	if (schemas.size() > 0) {
-		condition += "AND n.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
-	}
+	auto condition = "AND " + PostgresSchemaSet::GetSchemaCondition("n.nspname", schemas);
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
 

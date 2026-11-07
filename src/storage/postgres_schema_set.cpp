@@ -62,6 +62,19 @@ static vector<unique_ptr<PostgresResultSlice>> SliceResultByName(PostgresResult 
 	return result;
 }
 
+//! The system schemas are large and rarely used - unless SCHEMA lists them, they are loaded when they are used
+static const vector<string> &SystemSchemas() {
+	static const vector<string> system_schemas {"information_schema", "pg_catalog", "pg_toast"};
+	return system_schemas;
+}
+
+string PostgresSchemaSet::GetSchemaCondition(const string &column, const vector<string> &schemas) {
+	if (schemas.empty()) {
+		return column + " NOT IN (" + PostgresUtils::WriteLiteralsCommaSeparated(SystemSchemas()) + ")";
+	}
+	return column + " IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
+}
+
 string PostgresSchemaSet::GetInitializeQuery(const vector<string> &schemas) {
 	string base_query = R"(
 SELECT oid, nspname
@@ -69,10 +82,7 @@ FROM pg_namespace
 ${CONDITION}
 ORDER BY oid;
 )";
-	string condition;
-	if (schemas.size() > 0) {
-		condition += "WHERE pg_namespace.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
-	}
+	auto condition = "WHERE " + GetSchemaCondition("pg_namespace.nspname", schemas);
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
 
@@ -128,13 +138,18 @@ void PostgresSchemaSet::LoadEntries(ClientContext &context, PostgresTransaction 
 		LoadEntriesInformationSchema(context, transaction);
 		return;
 	}
+	LoadSchemas(context, transaction, schemas_to_load);
+}
+
+optional_ptr<CatalogEntry> PostgresSchemaSet::LoadSchemas(ClientContext &context, PostgresTransaction &transaction,
+                                                          const vector<string> &schemas) {
 	auto &pg_catalog = catalog.Cast<PostgresCatalog>();
 	auto pg_version = pg_catalog.GetPostgresVersion();
-	string schema_query = PostgresSchemaSet::GetInitializeQuery(schemas_to_load);
-	string tables_query = PostgresTableSet::GetInitializeQuery(pg_version, schemas_to_load);
-	string enum_types_query = PostgresTypeSet::GetInitializeEnumsQuery(pg_version, schemas_to_load);
-	string composite_types_query = PostgresTypeSet::GetInitializeCompositesQuery(schemas_to_load);
-	string index_query = PostgresIndexSet::GetInitializeQuery(schemas_to_load);
+	string schema_query = PostgresSchemaSet::GetInitializeQuery(schemas);
+	string tables_query = PostgresTableSet::GetInitializeQuery(pg_version, schemas);
+	string enum_types_query = PostgresTypeSet::GetInitializeEnumsQuery(pg_version, schemas);
+	string composite_types_query = PostgresTypeSet::GetInitializeCompositesQuery(schemas);
+	string index_query = PostgresIndexSet::GetInitializeQuery(schemas);
 
 	auto full_query = schema_query + tables_query + enum_types_query + composite_types_query + index_query;
 
@@ -147,6 +162,7 @@ void PostgresSchemaSet::LoadEntries(ClientContext &context, PostgresTransaction 
 	auto enums = SliceResult(*result, std::move(results[1]));
 	auto composite_types = SliceResult(*result, std::move(results[2]));
 	auto indexes = SliceResult(*result, std::move(results[3]));
+	optional_ptr<CatalogEntry> entry;
 	for (idx_t row = 0; row < rows; row++) {
 		auto oid = result->GetInt64(row, 0);
 		auto schema_name = result->GetString(row, 1);
@@ -156,8 +172,22 @@ void PostgresSchemaSet::LoadEntries(ClientContext &context, PostgresTransaction 
 		info.internal = PostgresSchemaEntry::SchemaIsInternal(schema_name);
 		auto schema = make_shared_ptr<PostgresSchemaEntry>(catalog, info, std::move(tables[row]), std::move(enums[row]),
 		                                                   std::move(composite_types[row]), std::move(indexes[row]));
-		CreateEntry(transaction, std::move(schema));
+		entry = CreateEntry(transaction, std::move(schema));
 	}
+	return entry;
+}
+
+optional_ptr<CatalogEntry> PostgresSchemaSet::ReloadEntry(PostgresTransaction &transaction, const string &name) {
+	auto &context = *transaction.GetContext();
+	auto &system_schemas = SystemSchemas();
+	auto system_schema = std::find_if(system_schemas.begin(), system_schemas.end(),
+	                                  [&](const string &schema) { return StringUtil::CIEquals(schema, name); });
+	// only the system schemas are left out when the schemas are loaded
+	if (!schemas_to_load.empty() || system_schema == system_schemas.end() ||
+	    PostgresUtils::UseInformationSchemaIntrospection(context)) {
+		return nullptr;
+	}
+	return LoadSchemas(context, transaction, {*system_schema});
 }
 
 optional_ptr<CatalogEntry> PostgresSchemaSet::CreateSchema(PostgresTransaction &transaction, CreateSchemaInfo &info) {

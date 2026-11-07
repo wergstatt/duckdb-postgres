@@ -1,0 +1,36 @@
+# name: test/sql/scanner/postgres_query_execute_in_bind.test
+# description: postgres_query runs the query at bind when asked, instead of describing it first
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+# the query is not prepared to describe it, so no prepared statement holds it while it runs
+query II
+FROM postgres_query('s', 'SELECT CAST($1 AS INTEGER) + 1 AS i, count(*) AS prepared FROM pg_prepared_statements
+    WHERE statement LIKE ''%execute in bind%''', params := row(41), execute_in_bind := true)
+----
+42	0
+
+# the scan reads the result of bind, the query reaches the server once
+query I
+SELECT count(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE '%execute in bind%'
+----
+1
+
+statement error
+FROM postgres_query('s', 'SET LOCAL work_mem = ''64MB''', execute_in_bind := true)
+----
+execute_in_bind requires a query that returns columns
+
+statement error
+FROM postgres_query('s', 'SELECT 1', preliminary_queries := ['SET LOCAL work_mem = ''64MB'''], execute_in_bind := true)
+----
+execute_in_bind cannot be combined with preliminary_queries

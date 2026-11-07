@@ -217,6 +217,10 @@ DETACH s
 
 # health check query
 
+# run the health check every time a connection is taken from or returned to the pool
+statement ok
+SET pg_pool_health_check_interval_millis = 0
+
 query I
 SELECT current_setting('pg_pool_health_check_query')
 ----
@@ -267,3 +271,17 @@ RESET GLOBAL pg_pool_health_check_query
 
 statement ok
 DETACH s
+
+# NULL disables the health check
+
+statement ok
+SET GLOBAL pg_pool_health_check_query = NULL
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES);
+
+query II
+SELECT catalog_name, health_check_query
+FROM postgres_configure_pool(catalog_name='s')
+----
+s	(empty)

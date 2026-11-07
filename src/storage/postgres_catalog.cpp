@@ -41,7 +41,16 @@
 
 namespace duckdb {
 
-void PostgresCatalog::InitializeRemotePushdown(ClientContext &context, PostgresConnection &connection) {
+//! The collation, character classification, locale provider, locale, encoding and time zone of the database
+static string GetCollationQuery(const PostgresVersion &version) {
+	string provider_query = version >= PostgresVersion(15, 0) ? "datlocprovider::text" : "'c'";
+	string locale_query = version >= PostgresVersion(17, 0) ? "datlocale" : "NULL";
+	return "SELECT datcollate, datctype, " + provider_query + ", " + locale_query +
+	       ", pg_encoding_to_char(encoding), current_setting('TimeZone') "
+	       "FROM pg_database WHERE datname = current_database()";
+}
+
+void PostgresCatalog::InitializeRemotePushdown(ClientContext &context, optional_ptr<PostgresResult> result) {
 	Value enabled_val;
 	if (context.TryGetCurrentSetting("pg_enable_remote_pushdown", enabled_val) && !enabled_val.IsNull()) {
 		remote_pushdown_enabled = BooleanValue::Get(enabled_val);
@@ -69,11 +78,6 @@ void PostgresCatalog::InitializeRemotePushdown(ClientContext &context, PostgresC
 	info.read_only = access_mode == AccessMode::READ_ONLY;
 	// string ordering only matches DuckDB's (byte-wise) ordering with C-like collations, and case mapping only
 	// matches DuckDB's (Unicode) case mapping when the character classification is not plain ASCII
-	string provider_query = version >= PostgresVersion(15, 0) ? "datlocprovider::text" : "'c'";
-	string locale_query = version >= PostgresVersion(17, 0) ? "datlocale" : "NULL";
-	auto result = connection.TryQuery(context, "SELECT datcollate, datctype, " + provider_query + ", " + locale_query +
-	                                               ", pg_encoding_to_char(encoding), current_setting('TimeZone') "
-	                                               "FROM pg_database WHERE datname = current_database()");
 	if (result && result->Count() > 0) {
 		auto collation = result->GetString(0, 0);
 		auto ctype = result->GetString(0, 1);
@@ -284,7 +288,10 @@ unique_ptr<TableRef> PostgresCatalog::RemoteExecute(ClientContext &context, uniq
 		    ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(preliminary_values)))));
 	}
 	if (PostgresIsDMLWithoutReturning(*node)) {
-		// the statement yields the number of changed rows
+		// the statement yields the number of changed rows, so it is not prepared to describe its result
+		args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                               make_uniq<ColumnRefExpression>("prepare"),
+		                                               ConstantExpression::FromValue(Value::BOOLEAN(false))));
 		args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
 		                                               make_uniq<ColumnRefExpression>("return_changed_rows"),
 		                                               ConstantExpression::FromValue(Value::BOOLEAN(true))));
@@ -441,8 +448,17 @@ PostgresCatalog::PostgresCatalog(ClientContext &ctx, AttachedDatabase &db_p, str
 		auto oauth_token_holder = SetThreadLocalOAuthTokenFromSessionOption(ctx);
 		connection = connection_pool->Acquire();
 	}
-	this->version = connection.GetConnection().GetPostgresVersion(ctx);
-	InitializeRemotePushdown(ctx, connection.GetConnection());
+	auto &con = connection.GetConnection();
+	// the probes go in one round trip: the server version libpq got when connecting picks the collation probe
+	vector<string> probes {PostgresConnection::GetPostgresVersionQuery(),
+	                       GetCollationQuery(PostgresVersion(PQserverVersion(con.GetConn()) / 10000, 0))};
+	if (!secret_storage_table.DisabledByUser()) {
+		probes.push_back(secret_storage_table.ExistsQuery());
+	}
+	auto results = con.TryQueries(ctx, probes);
+	this->version = PostgresConnection::GetPostgresVersion(results[0].get());
+	InitializeRemotePushdown(ctx, results[1].get());
+	secret_storage_table_exists = results.size() > 2 && secret_storage_table.Exists(con, results[2].get());
 }
 
 unique_ptr<SecretEntry> PostgresCatalog::GetSecretEntry(ClientContext &ctx, const std::string &secret_name) {
@@ -657,10 +673,6 @@ void PostgresCatalog::RegisterSecretStorage() {
 		return;
 	}
 
-	// Look up whether the table exists in DB
-	auto connection = connection_pool->Acquire();
-	bool secret_storage_table_exists = secret_storage_table.Exists(connection.GetConnection());
-
 	string attached_database_name = GetAttached().GetName().GetIdentifierName();
 
 	if (!secret_storage_table_exists) {
@@ -671,6 +683,7 @@ void PostgresCatalog::RegisterSecretStorage() {
 		}
 
 		// Table does not exist and was requested by user - creating it in this PG catalog
+		auto connection = connection_pool->Acquire();
 		string create_table_error = secret_storage_table.Create(connection.GetConnection());
 		if (!create_table_error.empty()) {
 			throw IOException("Error initializing secrets storage table, name: \"%s\" in attached database: \"%s\": %s",

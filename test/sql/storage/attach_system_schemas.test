@@ -1,0 +1,31 @@
+# name: test/sql/storage/attach_system_schemas.test
+# description: The system schemas are not loaded with the other schemas, but when they are used
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 's' AND schema_name IN ('information_schema', 'pg_catalog', 'pg_toast')
+----
+0
+
+query I
+SELECT count(*) FROM s.pg_catalog.pg_namespace WHERE nspname = 'public'
+----
+1
+
+query I
+SELECT count(*) FROM s.INFORMATION_SCHEMA.schemata WHERE schema_name = 'public'
+----
+1
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 's' AND schema_name IN ('information_schema', 'pg_catalog', 'pg_toast') ORDER BY ALL
+----
+information_schema
+pg_catalog

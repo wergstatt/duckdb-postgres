@@ -1,0 +1,19 @@
+# name: test/sql/storage/attach_probes.test
+# description: ATTACH sends its probes of the server version, the collation and the secret storage in one request
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+query II
+SELECT count(*), bool_and(query LIKE '%version()%datcollate%to_regclass%')
+FROM duckdb_logs_parsed('PostgresQueryLog')
+----
+1	true

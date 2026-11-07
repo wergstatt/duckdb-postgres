@@ -284,7 +284,10 @@ unique_ptr<TableRef> PostgresCatalog::RemoteExecute(ClientContext &context, uniq
 		    ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(preliminary_values)))));
 	}
 	if (PostgresIsDMLWithoutReturning(*node)) {
-		// the statement yields the number of changed rows
+		// the statement yields the number of changed rows, so it is not prepared to describe its result
+		args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                               make_uniq<ColumnRefExpression>("prepare"),
+		                                               ConstantExpression::FromValue(Value::BOOLEAN(false))));
 		args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
 		                                               make_uniq<ColumnRefExpression>("return_changed_rows"),
 		                                               ConstantExpression::FromValue(Value::BOOLEAN(true))));

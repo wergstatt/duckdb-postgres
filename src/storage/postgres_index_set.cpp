@@ -10,6 +10,7 @@
 #include "postgres_utils.hpp"
 #include "storage/postgres_index_entry.hpp"
 #include "storage/postgres_schema_entry.hpp"
+#include "storage/postgres_schema_set.hpp"
 #include "storage/postgres_transaction.hpp"
 
 namespace duckdb {
@@ -26,10 +27,7 @@ JOIN pg_namespace ON (schemaname=nspname)
 ${CONDITION}
 ORDER BY pg_namespace.oid;
 )";
-	string condition;
-	if (schemas.size() > 0) {
-		condition += "WHERE pg_namespace.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
-	}
+	auto condition = "WHERE " + PostgresSchemaSet::GetSchemaCondition("pg_namespace.nspname", schemas);
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
 

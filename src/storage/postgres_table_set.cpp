@@ -111,10 +111,7 @@ JOIN pg_constraint ON (pg_class.oid=pg_constraint.conrelid)
 WHERE relkind IN ('r', 'v', 'm', 'f', 'p') AND contype IN ('p', 'u') ${CONDITION}
 ORDER BY namespace_id, relname, attnum, constraint_id;
 )";
-	string condition;
-	if (schemas.size() > 0) {
-		condition += "AND pg_namespace.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
-	}
+	auto condition = "AND " + PostgresSchemaSet::GetSchemaCondition("pg_namespace.nspname", schemas);
 	if (!table.empty()) {
 		condition += "AND relname=" + PostgresUtils::WriteLiteral(table);
 	}

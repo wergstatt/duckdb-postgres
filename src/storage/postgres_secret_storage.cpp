@@ -20,19 +20,17 @@ SecretStorageTable::SecretStorageTable(string name_p, bool specified_explicitly_
     : name(specified_explicitly_p ? std::move(name_p) : default_name), specified_explicitly(specified_explicitly_p) {
 }
 
-bool SecretStorageTable::Exists(PostgresConnection &connection) {
+string SecretStorageTable::ExistsQuery() {
+	return StringUtil::Format("SELECT to_regclass('%s')", name);
+}
+
+bool SecretStorageTable::Exists(PostgresConnection &connection, optional_ptr<PostgresResult> exists_result) {
 	if (name.empty()) {
 		return false;
 	}
 
-	// Check whether the table exists, 'to_regclass' should require the least priviliges
-	{
-		string query = StringUtil::Format("SELECT to_regclass('%s')", name);
-		string err_msg;
-		auto res = connection.TryQuery(nullptr, query, &err_msg);
-		if (err_msg.empty()) {
-			return !res->IsNull(0, 0);
-		}
+	if (exists_result) {
+		return !exists_result->IsNull(0, 0);
 	}
 
 	// 'to_regclass()' has returned an error, either the name is invalid

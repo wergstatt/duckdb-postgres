@@ -196,8 +196,53 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	return results;
 }
 
+vector<unique_ptr<PostgresResult>> PostgresConnection::TryQueries(optional_ptr<ClientContext> context,
+                                                                  const vector<string> &queries) {
+	auto all_queries = StringUtil::Join(queries, ";\n");
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print(all_queries + "\n");
+	}
+	int64_t start_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
+	                         .time_since_epoch()
+	                         .count();
+	lock_guard<mutex> guard(connection_lock);
+	auto conn = GetConn();
+	if (!PQenterPipelineMode(conn)) {
+		throw std::runtime_error("Failed to execute query \"" + all_queries + "\": " + string(PQerrorMessage(conn)));
+	}
+	// a sync after each query runs it in a transaction of its own, so that its error affects no other query
+	for (auto &query : queries) {
+		PQsendQueryParams(conn, query.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 0);
+		PQsendPipelineSync(conn);
+	}
+	PQflush(conn);
+	vector<unique_ptr<PostgresResult>> results;
+	for (idx_t i = 0; i < queries.size(); i++) {
+		// the result of the query, the end of its results and the result of the sync
+		auto result = make_uniq<PostgresResult>(PQgetResult(conn));
+		PQclear(PQgetResult(conn));
+		PQclear(PQgetResult(conn));
+		results.push_back(ResultHasError(result->res) ? nullptr : std::move(result));
+	}
+	PQexitPipelineMode(conn);
+	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
+	                       .time_since_epoch()
+	                       .count();
+	if (context) {
+		DUCKDB_LOG(*context, PostgresQueryLogType, all_queries, end_time - start_time);
+	}
+	return results;
+}
+
 PostgresVersion PostgresConnection::GetPostgresVersion(ClientContext &context) {
-	auto result = TryQuery(context, "SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')");
+	return GetPostgresVersion(TryQuery(context, GetPostgresVersionQuery()).get());
+}
+
+string PostgresConnection::GetPostgresVersionQuery() {
+	return "SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')";
+}
+
+PostgresVersion PostgresConnection::GetPostgresVersion(optional_ptr<PostgresResult> result) {
 	if (!result) {
 		PostgresVersion version;
 		version.type_v = PostgresInstanceType::UNKNOWN;

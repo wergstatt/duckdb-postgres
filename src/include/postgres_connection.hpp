@@ -51,8 +51,13 @@ public:
 
 	//! Submits a set of queries to be executed in the connection.
 	vector<unique_ptr<PostgresResult>> ExecuteQueries(ClientContext &context, const string &queries);
+	//! Runs queries in one round trip, each on its own as TryQuery runs it: the result of each, nullptr if it failed
+	vector<unique_ptr<PostgresResult>> TryQueries(optional_ptr<ClientContext> context, const vector<string> &queries);
 
 	PostgresVersion GetPostgresVersion(ClientContext &context);
+	static string GetPostgresVersionQuery();
+	//! The version from the result of GetPostgresVersionQuery
+	static PostgresVersion GetPostgresVersion(optional_ptr<PostgresResult> result);
 
 	vector<IndexInfo> GetIndexInfo(const string &table_name);
 

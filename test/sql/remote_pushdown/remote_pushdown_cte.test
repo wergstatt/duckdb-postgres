@@ -178,3 +178,17 @@ query II
 EXPLAIN WITH RECURSIVE r(n, v) USING KEY (n) AS (SELECT 1, 1 UNION SELECT n, v + 1 FROM r WHERE v < 3) SELECT r.* FROM r JOIN s.rp_cte t ON t.i = r.n
 ----
 physical_plan	<!REGEX>:(?s).*Postgres Query.*
+
+# a CTE reference is not looked up as a table in Postgres
+statement ok
+CALL enable_logging('PostgresQueryLog')
+
+query I
+WITH rp_cte_lookup AS (SELECT i FROM s.rp_cte) SELECT COUNT(*) FROM rp_cte_lookup
+----
+10
+
+query I
+SELECT COUNT(*) FROM duckdb_logs_parsed('PostgresQueryLog') WHERE query LIKE '%relname=''rp_cte_lookup''%'
+----
+0

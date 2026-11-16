@@ -160,12 +160,12 @@ execute_in_bind requires a query that returns columns
 statement error
 FROM postgres_query('s', 'SELECT * FROM execute_in_bind_no_such_table', execute_in_bind := true)
 ----
-Binder Error: Failed to execute query "SELECT * FROM execute_in_bind_no_such_table": ERROR:  relation "execute_in_bind_no_such_table" does not exist
+Binder Error: Failed to execute query: ERROR:  relation "execute_in_bind_no_such_table" does not exist
 
 statement error
 FROM postgres_query('s', 'SELECT 1 / 0', execute_in_bind := true)
 ----
-Binder Error: Failed to execute query "SELECT 1 / 0": ERROR:  division by zero
+Binder Error: Failed to execute query: ERROR:  division by zero
 
 statement ok
 CALL postgres_execute('s', 'DROP TABLE execute_in_bind_types')

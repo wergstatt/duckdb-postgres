@@ -83,8 +83,7 @@ static unique_ptr<FunctionData> BindDML(ClientContext &context, TableFunctionBin
 	return std::move(result);
 }
 
-static PostgresQueryMode ResolveQueryMode(ClientContext &context, TableFunctionBindInput &input,
-                                          const vector<Value> &params) {
+static PostgresQueryMode ResolveQueryMode(ClientContext &context, TableFunctionBindInput &input, bool has_params) {
 	auto it = input.named_parameters.find(Identifier("query_mode"));
 	if (it != input.named_parameters.end()) {
 		Value &str_val = it->second;
@@ -107,10 +106,71 @@ static PostgresQueryMode ResolveQueryMode(ClientContext &context, TableFunctionB
 	    BooleanValue::Get(text_proto_val)) {
 		return PostgresQueryMode::PLAIN_QUERY_TEXT;
 	}
-	if (params.size() > 0) {
+	if (has_params) {
 		return PostgresQueryMode::PLAIN_QUERY_BINARY;
 	}
 	return PostgresQueryMode::AUTO;
+}
+
+struct QueryBindDescription {
+	unique_ptr<PostgresPreparedStatement> prepared;
+	//! Either the PQdescribePrepared result or the result of running the query in bind
+	unique_ptr<PostgresResult> result;
+	PostgresParameters params;
+};
+
+static QueryBindDescription ExecuteQueryInBind(ClientContext &context, PostgresConnection &con, const string &sql,
+                                               vector<Value> param_values, const vector<string> &preliminary_queries) {
+	if (!preliminary_queries.empty()) {
+		throw BinderException("execute_in_bind cannot be combined with preliminary_queries");
+	}
+	QueryBindDescription desc;
+	desc.params = PostgresParameters::Text(std::move(param_values));
+	string error_message;
+	// the result describes the query, so that it is not prepared and described in a round trip of its own
+	desc.result = con.TryQuery(context, sql, &error_message, desc.params, 1);
+	if (!desc.result) {
+		throw BinderException(error_message);
+	}
+	if (PQnfields(desc.result->res) <= 0) {
+		throw BinderException("execute_in_bind requires a query that returns columns, but ran \"%s\"", sql);
+	}
+	return desc;
+}
+
+static QueryBindDescription DescribePreparedQuery(PostgresConnection &con, uint64_t pool_connection_id,
+                                                  const string &sql, vector<Value> param_values) {
+	QueryBindDescription desc;
+	auto conn_lock = con.Lock();
+	auto conn = con.GetConn();
+	// prepare execution of the query to figure out the result types and names
+	string stmt_name = PostgresPreparedStatement::GenerateName();
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("PREPARE " + stmt_name + ": " + sql + "\n");
+	}
+	PGresult *prepared_res_ptr = PQprepare(conn, stmt_name.c_str(), sql.c_str(), 0, nullptr);
+	desc.prepared = make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
+	// use describe_prepared
+	desc.result = make_uniq<PostgresResult>(PQdescribePrepared(conn, desc.prepared->GetName().c_str()));
+	auto describe_prepared = desc.result->res;
+	if (!describe_prepared || PQresultStatus(describe_prepared) != PGRES_COMMAND_OK) {
+		auto extended_err = PostgresUtils::GetErrorMessage(describe_prepared, conn);
+		throw BinderException("Failed to describe prepared statement: %s", extended_err);
+	}
+	conn_lock.unlock();
+
+	int nparams = PQnparams(describe_prepared);
+	if (nparams != param_values.size()) {
+		throw BinderException("Incorrect number of parameters specified, expected: %d, actual: %zu", nparams,
+		                      param_values.size());
+	}
+	vector<Oid> param_types;
+	param_types.reserve(nparams);
+	for (idx_t p = 0; p < nparams; p++) {
+		param_types.emplace_back(PQparamtype(describe_prepared, p));
+	}
+	desc.params = PostgresParameters(std::move(param_types), std::move(param_values));
+	return desc;
 }
 
 static string StripTrailingSemicolon(string sql) {
@@ -231,57 +291,15 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 		               PostgresParameters::Text(std::move(param_values)), nullptr);
 	}
 
-	unique_ptr<PostgresPreparedStatement> prepared;
-	// the description of the prepared statement, or the result of the query when bind runs it
-	unique_ptr<PostgresResult> describe_wrapper;
-	if (execute_in_bind) {
-		if (!preliminary_queries.empty()) {
-			throw BinderException("execute_in_bind cannot be combined with preliminary_queries");
-		}
-		// the result describes the query, so that it is not prepared and described in a round trip of its own
-		string error_message;
-		describe_wrapper = con.TryQuery(context, sql, &error_message, PostgresParameters::Text(param_values), 1);
-		if (!describe_wrapper) {
-			throw BinderException(error_message);
-		}
-	} else {
-		auto conn_lock = con.Lock();
-		auto conn = con.GetConn();
-		// prepare execution of the query to figure out the result types and names
-		string stmt_name = PostgresPreparedStatement::GenerateName();
-		if (PostgresConnection::DebugPrintQueries()) {
-			Printer::Print("PREPARE " + stmt_name + ": " + sql + "\n");
-		}
-		PGresult *prepared_res_ptr = PQprepare(conn, stmt_name.c_str(), sql.c_str(), 0, nullptr);
-		prepared = make_uniq<PostgresPreparedStatement>(conn, pool_connection_id, stmt_name, sql, prepared_res_ptr);
-		// use describe_prepared
-		describe_wrapper = make_uniq<PostgresResult>(PQdescribePrepared(conn, prepared->GetName().c_str()));
-		auto describe_prepared = describe_wrapper->res;
-		if (!describe_prepared || PQresultStatus(describe_prepared) != PGRES_COMMAND_OK) {
-			auto extended_err = PostgresUtils::GetErrorMessage(describe_prepared, conn);
-			throw BinderException("Failed to describe prepared statement: %s", extended_err);
-		}
-	}
-	auto describe_prepared = describe_wrapper->res;
-	// a result describes no parameters, the server checked them when it ran the query
-	int nparams = PQnparams(describe_prepared);
-	if (!execute_in_bind && nparams != param_values.size()) {
-		throw BinderException("Incorrect number of parameters specified, expected: %d, actual: %zu", nparams,
-		                      param_values.size());
-	}
-	vector<Oid> param_types;
-	for (idx_t p = 0; p < nparams; p++) {
-		Oid ptype = PQparamtype(describe_prepared, p);
-		param_types.emplace_back(ptype);
-	}
+	auto query_desc = execute_in_bind
+	                      ? ExecuteQueryInBind(context, con, sql, std::move(param_values), preliminary_queries)
+	                      : DescribePreparedQuery(con, pool_connection_id, sql, std::move(param_values));
+	auto describe_prepared = query_desc.result->res;
 	int nfields = PQnfields(describe_prepared);
 	if (nfields <= 0) {
-		if (execute_in_bind) {
-			throw BinderException("execute_in_bind requires a query that returns columns, but ran \"%s\"", sql);
-		}
 		return BindDML(context, input, return_types, names, catalog, con, std::move(preliminary_queries),
-		               std::move(sql), use_transaction, pinned_connection_id,
-		               PostgresParameters(std::move(param_types), std::move(param_values)), std::move(prepared));
+		               std::move(sql), use_transaction, pinned_connection_id, std::move(query_desc.params),
+		               std::move(query_desc.prepared));
 	}
 	auto result = make_uniq<PostgresBindData>(context, catalog.GetName());
 	result->pinned_connection_id = pinned_connection_id;
@@ -304,13 +322,6 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 		char *name_ptr = PQfname(describe_prepared, c);
 		string name = name_ptr ? name_ptr : "unnamed";
 		names.emplace_back(name);
-		if (execute_in_bind && (ContainsCastToVarchar(postgres_type) ||
-		                        postgres_type.info == PostgresTypeAnnotation::TEXT_PROTOCOL_ONLY)) {
-			// the scan query would cast such a column to VARCHAR, but the scan reads the result that bind got
-			throw BinderException("Column \"%s\" has a type that cannot be read in the binary format, cast it to TEXT "
-			                      "in the query: \"%s\"",
-			                      name, sql);
-		}
 	}
 	PostgresUtils::DeduplicateColumns(names);
 
@@ -324,19 +335,29 @@ static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctio
 	result->read_only = false;
 	result->preliminary_queries = std::move(preliminary_queries);
 	result->sql = std::move(sql);
-	result->query_mode = ResolveQueryMode(context, input, param_values);
-	result->params = execute_in_bind ? PostgresParameters::Text(std::move(param_values))
-	                                 : PostgresParameters(std::move(param_types), std::move(param_values));
+	result->params = std::move(query_desc.params);
 	result->use_transaction = use_transaction;
-	result->prepared_statement = std::move(prepared);
+	result->clear_catalog_cache = ExtractFlag(input, "clear_catalog_cache", false);
 	if (execute_in_bind) {
+		for (idx_t c = 0; c < result->postgres_types.size(); c++) {
+			auto &postgres_type = result->postgres_types[c];
+			if (ContainsCastToVarchar(postgres_type) ||
+			    postgres_type.info == PostgresTypeAnnotation::TEXT_PROTOCOL_ONLY) {
+				// the scan query would cast such a column to VARCHAR, but the scan reads the result that bind got
+				throw BinderException("Column \"%s\" has a type that cannot be read in the binary format, cast it to "
+				                      "TEXT in the query: \"%s\"",
+				                      result->names[c], result->sql);
+			}
+		}
 		// the scan reads the result instead of running the query again, in the binary format it has
 		result->query_mode = PostgresQueryMode::PLAIN_QUERY_BINARY;
 		result->execute_in_bind = true;
-		result->bind_result = std::move(describe_wrapper);
+		result->bind_result = std::move(query_desc.result);
 		result->bind_query = context.transaction.GetActiveQuery();
+	} else {
+		result->query_mode = ResolveQueryMode(context, input, !result->params.Empty());
+		result->prepared_statement = std::move(query_desc.prepared);
 	}
-	result->clear_catalog_cache = ExtractFlag(input, "clear_catalog_cache", false);
 	PostgresScanFunction::PrepareBind(catalog.GetPostgresVersion(), context, *result, 0, catalog);
 	RegisterDatabaseAccess(context, input, catalog);
 	return std::move(result);

@@ -168,6 +168,9 @@ PostgresBindData::PostgresBindData(ClientContext &context, const Identifier &cat
 }
 
 unique_ptr<PostgresResult> PostgresBindData::TakeBindResult(ClientContext &context) const {
+	if (!execute_in_bind) {
+		return nullptr;
+	}
 	lock_guard<mutex> guard(bind_result_lock);
 	if (bind_result && bind_query != context.transaction.GetActiveQuery()) {
 		// a prepared statement, bound by an earlier statement: the data may be out of date, run the query again
